@@ -1,0 +1,18 @@
+services:
+  simpaniz:
+    build: .
+    ports:
+      - "9000:9000"
+    volumes:
+      - simpaniz-data:/data
+    environment:
+      SIMPANIZ_HOST: "0.0.0.0"
+      SIMPANIZ_PORT: "9000"
+      SIMPANIZ_DATA_DIR: "/data"
+      SIMPANIZ_REGION: "us-east-1"
+      SIMPANIZ_ACCESS_KEY: ""
+      SIMPANIZ_SECRET_KEY: ""
+    restart: unless-stopped
+
+volumes:
+  simpaniz-data:

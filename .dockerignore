@@ -1,0 +1,8 @@
+.zig-cache/
+zig-out/
+.git/
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+.gitignore

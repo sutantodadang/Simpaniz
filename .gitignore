@@ -1,0 +1,20 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+zig-cache/
+
+# Local data / state
+data/
+smoke-data/
+*.log
+.simpaniz-*/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Session-only artifacts
+*.tmp
