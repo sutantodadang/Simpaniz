@@ -136,7 +136,7 @@ pub fn installSignalHandlers() void {
     const posix = std.posix;
     var act = posix.Sigaction{
         .handler = .{ .handler = sigHandler },
-        .mask = posix.empty_sigset,
+        .mask = std.mem.zeroes(posix.sigset_t),
         .flags = 0,
     };
     posix.sigaction(posix.SIG.INT, &act, null);
