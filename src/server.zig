@@ -127,7 +127,7 @@ pub fn requestShutdown() void {
     shutdown_requested.store(true, .seq_cst);
 }
 
-fn sigHandler(_: c_int) callconv(.C) void {
+fn sigHandler(_: c_int) callconv(.c) void {
     requestShutdown();
 }
 

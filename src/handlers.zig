@@ -548,14 +548,14 @@ pub fn clusterHealth(ctx: HandlerContext) http.Response {
     var buf = std.ArrayList(u8){};
     defer buf.deinit(ctx.allocator);
     buf.appendSlice(ctx.allocator, "{\"mode\":\"cluster\",\"self\":\"") catch return internal(ctx, "/cluster/health");
-    buf.appendSlice(ctx.allocator, cr.config.self) catch {};
+    buf.appendSlice(ctx.allocator, cr.config.node_id) catch {};
     buf.appendSlice(ctx.allocator, "\",\"peers\":[") catch {};
     var first = true;
     for (cr.config.peers) |p| {
         if (!first) buf.appendSlice(ctx.allocator, ",") catch {};
         first = false;
         buf.appendSlice(ctx.allocator, "{\"node\":\"") catch {};
-        buf.appendSlice(ctx.allocator, p) catch {};
+        buf.appendSlice(ctx.allocator, p.id) catch {};
         buf.appendSlice(ctx.allocator, "\"}") catch {};
     }
     buf.appendSlice(ctx.allocator, "]}") catch {};
@@ -709,7 +709,7 @@ pub fn completeMultipart(ctx: HandlerContext, bucket: []const u8, key: []const u
         };
 
         // Drop local copy now that it's in the cluster.
-        storage.deleteObject(ctx.data_dir, bucket, key) catch {};
+        storage.deleteObject(ctx.data_dir, ctx.allocator, bucket, key) catch {};
 
         if (cr.replication) |repl| {
             repl.enqueue(bucket, key, etag_fixed, cmeta.original_size, cmeta.last_modified) catch {};
