@@ -48,6 +48,7 @@ jobs:
           set -euxo pipefail
           mkdir -p smoke-data
           SIMPANIZ_HOST=127.0.0.1 SIMPANIZ_PORT=19001 SIMPANIZ_DATA_DIR=./smoke-data \
+            SIMPANIZ_ANONYMOUS=1 \
             ./zig-out/bin/simpaniz &
           SERVER_PID=$!
           trap "kill $SERVER_PID || true" EXIT

@@ -275,7 +275,7 @@ pub fn writeResponse(writer: *Io.Writer, resp: *const Response, head_only: bool)
     try writer.print("Content-Length: {d}\r\n", .{resp.body.length()});
     try writer.print("Content-Type: {s}\r\n", .{resp.content_type});
     try writer.writeAll("Connection: keep-alive\r\n");
-    try writer.writeAll("Server: Simpaniz/0.2.0\r\n");
+    try writer.writeAll("Server: Simpaniz/0.1.1\r\n");
     for (resp.extra_headers) |h| {
         try writer.writeAll(h);
         if (!std.mem.endsWith(u8, h, "\r\n")) try writer.writeAll("\r\n");

@@ -14,6 +14,7 @@ const util = @import("util.zig");
 const metrics = @import("metrics.zig");
 const storage = @import("storage.zig");
 const cluster = @import("cluster.zig");
+const ui = @import("ui.zig");
 
 const DaemonCtx = struct {
     data_dir: std.fs.Dir,
@@ -265,6 +266,16 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
             http.writeError(&sw.interface, 413, "Payload Too Large", "");
             sw.interface.flush() catch return;
             return;
+        }
+
+        // Web console assets — public static bundle, bypasses SigV4. The S3
+        // calls the console makes from the browser are still signed and go
+        // through normal auth.
+        if (ui.matches(request.path)) {
+            const resp = ui.serve(request.path);
+            writeAndLog(&sw.interface, &request, &resp, request_id, start_ns, ctx);
+            drainBody(&request) catch return;
+            continue;
         }
 
         // Cluster internal endpoint — bypass SigV4, authenticated via shared

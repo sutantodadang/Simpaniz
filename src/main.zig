@@ -3,6 +3,7 @@ const std = @import("std");
 const Config = @import("config.zig");
 const server = @import("server.zig");
 const metrics = @import("metrics.zig");
+const bootstrap = @import("bootstrap.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -14,7 +15,7 @@ pub fn main() !void {
     var config = Config.load(gpa);
     defer config.deinit();
 
-    std.log.info("Simpaniz v0.2.0 starting (data={s}, region={s})", .{ config.data_dir, config.region });
+    std.log.info("Simpaniz v0.1.1 starting (data={s}, region={s})", .{ config.data_dir, config.region });
 
     if (config.tls_cert_path.len > 0 or config.tls_key_path.len > 0) {
         std.log.err(
@@ -38,6 +39,12 @@ pub fn main() !void {
         break :blk try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
     };
     defer data_dir.close();
+
+    // First-run admin credential bootstrap. Generates and persists a root
+    // credential under data_dir on first launch when none is configured via
+    // env vars, mirroring the MinIO root-user UX so the web console works
+    // out of the box.
+    try bootstrap.ensureCredentials(&config, data_dir);
 
     var registry = metrics.Registry{ .started_unix = std.time.timestamp() };
 

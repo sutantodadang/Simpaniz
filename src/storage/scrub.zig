@@ -27,7 +27,7 @@ pub const ScrubStats = struct {
 pub fn runOnce(data_dir: Dir, allocator: std.mem.Allocator) !ScrubStats {
     var stats: ScrubStats = .{};
 
-    var iter = data_dir.iterateAssumeFirstIteration();
+    var iter = data_dir.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind != .directory) continue;
         if (std.mem.startsWith(u8, entry.name, ".")) continue;

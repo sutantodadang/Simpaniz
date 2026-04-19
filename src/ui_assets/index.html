@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Simpaniz Console</title>
+<link rel="stylesheet" href="/console/style.css">
+</head>
+<body>
+
+<div id="login-view" class="login-wrap hidden">
+  <form id="login-form" class="login-card">
+    <h1>Simpaniz</h1>
+    <p class="muted">Sign in to the object storage console</p>
+    <label>Region
+      <input id="login-region" value="us-east-1" autocomplete="off">
+    </label>
+    <label>Access key
+      <input id="login-access" autocomplete="username" autofocus>
+    </label>
+    <label>Secret key
+      <input id="login-secret" type="password" autocomplete="current-password">
+    </label>
+    <label class="row">
+      <input id="login-anon" type="checkbox">
+      <span>Server has no auth (anonymous mode)</span>
+    </label>
+    <button type="submit">Sign in</button>
+    <div id="login-error" class="error"></div>
+  </form>
+</div>
+
+<div id="app-view" class="hidden">
+  <header class="topbar">
+    <div class="brand">simpaniz</div>
+    <div class="grow"></div>
+    <span id="who" class="muted"></span>
+    <button id="logout" class="link">Sign out</button>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="side-head">
+        <h2>Buckets</h2>
+        <button id="new-bucket" title="Create bucket">+</button>
+      </div>
+      <ul id="bucket-list"></ul>
+    </aside>
+
+    <main class="main">
+      <div id="empty-main" class="empty">Select or create a bucket.</div>
+      <section id="browser" class="hidden">
+        <div class="browser-head">
+          <nav id="crumbs" class="crumbs"></nav>
+          <div class="actions">
+            <label class="upload-btn">
+              <input type="file" id="upload-input" multiple hidden>
+              <span>Upload</span>
+            </label>
+            <button id="delete-bucket" class="danger">Delete bucket</button>
+          </div>
+        </div>
+        <div id="upload-status" class="upload-status"></div>
+        <table class="objects">
+          <thead>
+            <tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr>
+          </thead>
+          <tbody id="object-rows"></tbody>
+        </table>
+        <div id="empty-objects" class="empty hidden">This prefix is empty.</div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/console/app.js"></script>
+</body>
+</html>

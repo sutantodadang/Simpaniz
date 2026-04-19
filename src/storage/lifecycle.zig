@@ -134,7 +134,7 @@ pub const SweepStats = struct {
 /// rule's `expiration_days` whose key starts with `prefix`.
 pub fn sweep(data_dir: Dir, allocator: Allocator, now_ns: i128) !SweepStats {
     var stats: SweepStats = .{};
-    var iter = data_dir.iterateAssumeFirstIteration();
+    var iter = data_dir.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind != .directory) continue;
         if (std.mem.startsWith(u8, entry.name, ".")) continue;

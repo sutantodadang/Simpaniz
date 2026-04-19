@@ -58,7 +58,7 @@ pub fn listBuckets(data_dir: Dir, allocator: Allocator) Error![]BucketSummary {
         list.deinit(allocator);
     }
 
-    var iter = data_dir.iterateAssumeFirstIteration();
+    var iter = data_dir.iterate();
     while (iter.next() catch return error.Internal) |entry| {
         if (entry.kind != .directory) continue;
         if (std.mem.startsWith(u8, entry.name, ".")) continue;
@@ -88,4 +88,25 @@ test "createBucket rejects bad name" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try std.testing.expectError(error.InvalidKey, createBucket(tmp.dir, "Bad_Name"));
+}
+
+test "listBuckets is repeatable on the same dir handle" {
+    // Regression: we used to call iterateAssumeFirstIteration on the
+    // long-lived server data_dir handle. The first listBuckets returned
+    // results, every subsequent call returned an empty slice because the
+    // directory cursor had already been exhausted. Use iterate() so each
+    // call gets a fresh, rewound iterator.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try createBucket(tmp.dir, "alpha");
+    try createBucket(tmp.dir, "beta");
+    const a = std.testing.allocator;
+
+    const first = try listBuckets(tmp.dir, a);
+    defer { for (first) |b| a.free(b.name); a.free(first); }
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+
+    const second = try listBuckets(tmp.dir, a);
+    defer { for (second) |b| a.free(b.name); a.free(second); }
+    try std.testing.expectEqual(@as(usize, 2), second.len);
 }

@@ -2,7 +2,7 @@
 
 A small, single-binary, S3-compatible object server written in Zig.
 
-**Status:** v0.2.0 — production-grade for single-node workloads behind a
+**Status:** v0.1.1 — production-grade for single-node workloads behind a
 reverse proxy. See [`COMPATIBILITY.md`](./COMPATIBILITY.md) for the S3
 operation matrix and [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the design.
 
@@ -62,8 +62,9 @@ All configuration is via environment variables.
 | `SIMPANIZ_PORT`              | `9000`         | Listen port.                                               |
 | `SIMPANIZ_DATA_DIR`          | `./data`       | Storage root directory.                                    |
 | `SIMPANIZ_REGION`            | `us-east-1`    | AWS region used for SigV4 binding.                         |
-| `SIMPANIZ_ACCESS_KEY`        | *(empty)*      | S3 access key. Auth required if non-empty.                 |
+| `SIMPANIZ_ACCESS_KEY`        | *(empty)*      | S3 access key. Auth required if non-empty. If left empty, a root credential is generated on first launch and persisted to `<DATA_DIR>/.simpaniz-credentials` (printed to the log) so the web console works out of the box. Set `SIMPANIZ_ANONYMOUS=1` to opt out and run without auth.                 |
 | `SIMPANIZ_SECRET_KEY`        | *(empty)*      | S3 secret key.                                             |
+| `SIMPANIZ_ANONYMOUS`         | *(empty)*      | When `1` / `true` / `yes`, skip first-run credential bootstrap and run without authentication. |
 | `SIMPANIZ_MAX_BODY_BYTES`    | `5368709120`   | Per-request body cap (5 GiB). Larger requests get `413`.   |
 | `SIMPANIZ_MAX_HEADER_BYTES`  | `16384`        | Total request-header bytes.                                |
 | `SIMPANIZ_MAX_HEADERS`       | `64`           | Maximum number of header lines.                            |
@@ -100,6 +101,30 @@ matrix. Most clients (`curl`, `aws s3`, `boto3`, `aws-sdk-go`,
 | `/healthz`  | GET    | Liveness — server process up.                      |
 | `/readyz`   | GET    | Readiness — data directory writable.               |
 | `/metrics`  | GET    | Prometheus exposition format.                      |
+| `/console/` | GET    | Embedded web console (single-page admin UI).       |
+
+### Web console
+
+A minimal admin UI is baked into the binary at `/console/`. Open
+`http://localhost:9000/console/` in a browser to:
+
+- Sign in with your access/secret (or check **anonymous** if the server
+  has no credentials configured).
+- Create and delete buckets.
+- Browse objects with prefix/folder navigation.
+- Upload, download, and delete objects.
+
+On **first launch** with no `SIMPANIZ_ACCESS_KEY` / `SIMPANIZ_SECRET_KEY`
+in the environment, a random root credential is generated, persisted to
+`<DATA_DIR>/.simpaniz-credentials`, and printed to the log so you can
+sign in immediately. To run without auth (read-only public buckets,
+dev sandboxes), set `SIMPANIZ_ANONYMOUS=1` instead.
+
+The console is a vanilla HTML/JS bundle (no build step, zero deps) that
+talks to the existing S3 API. SigV4 is computed in the browser via Web
+Crypto, so every action is authenticated the same way as a `curl` or
+`aws s3` call. Credentials are kept in `sessionStorage` and never sent
+anywhere except as part of the S3 signature.
 
 ## Usage examples
 
@@ -167,7 +192,6 @@ future work, not "coming soon":
 - **Object Lock, Lifecycle, Versioning.**
 - **Replication and event notifications.**
 - **Distributed mode + erasure coding** (single-node only today).
-- **Admin web console.**
 
 These are what turn an "S3-compatible server" into a "distributed
 object store like MinIO" — they're not blockers for single-node
