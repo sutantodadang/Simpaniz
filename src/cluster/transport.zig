@@ -8,8 +8,8 @@
 //! Implementations:
 //!   - `LocalTransport` — every "node" is a subdirectory on the local
 //!     filesystem. Used by tests and by the single-node fallback path.
-//!   - `HttpTransport`  — TODO. Will PUT/GET shards to peers via the
-//!     internal `/_simpaniz/shards/...` endpoint.
+//!   - `HttpTransport`  — PUT/GET/DELETE shards and metadata through the
+//!     internal `/_simpaniz/...` endpoints.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

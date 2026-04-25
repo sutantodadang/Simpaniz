@@ -901,14 +901,24 @@ fn qp(query: []const u8, key: []const u8) ?[]const u8 {
 const Range = struct { start: u64, end: u64 };
 
 fn parseRange(header: []const u8, total: u64) ?Range {
-    // Only support "bytes=start-end" or "bytes=start-".
+    // Supports single HTTP byte ranges:
+    //   bytes=start-end, bytes=start-, and suffix ranges bytes=-count.
     const prefix = "bytes=";
     if (!std.mem.startsWith(u8, header, prefix)) return null;
+    if (total == 0) return null;
     const spec = header[prefix.len..];
     const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
     const start_s = spec[0..dash];
     const end_s = spec[dash + 1 ..];
-    if (start_s.len == 0) return null; // suffix range not yet supported
+
+    if (start_s.len == 0) {
+        if (end_s.len == 0) return null;
+        const suffix_len = std.fmt.parseInt(u64, end_s, 10) catch return null;
+        if (suffix_len == 0) return null;
+        const take = @min(suffix_len, total);
+        return .{ .start = total - take, .end = total - 1 };
+    }
+
     const start = std.fmt.parseInt(u64, start_s, 10) catch return null;
     var end: u64 = total - 1;
     if (end_s.len > 0) end = std.fmt.parseInt(u64, end_s, 10) catch return null;
@@ -931,15 +941,23 @@ test "parseRange basic" {
     try std.testing.expectEqual(@as(u64, 99), r.end);
     const r2 = parseRange("bytes=100-", 1000).?;
     try std.testing.expectEqual(@as(u64, 999), r2.end);
+    const r3 = parseRange("bytes=-100", 1000).?;
+    try std.testing.expectEqual(@as(u64, 900), r3.start);
+    try std.testing.expectEqual(@as(u64, 999), r3.end);
+    const r4 = parseRange("bytes=-2000", 1000).?;
+    try std.testing.expectEqual(@as(u64, 0), r4.start);
+    try std.testing.expectEqual(@as(u64, 999), r4.end);
     try std.testing.expect(parseRange("bytes=2000-3000", 1000) == null);
+    try std.testing.expect(parseRange("bytes=-0", 1000) == null);
+    try std.testing.expect(parseRange("bytes=0-0", 0) == null);
 }
 
 // ── Cluster-mode object handlers ─────────────────────────────────────────────
 //
-// In distributed mode, object data is buffered up to `max_body_bytes`,
-// erasure-coded across the peer set, and metadata is replicated to the
-// same set. Multipart uploads are NOT distributed in v1 — operators
-// must send single PUTs to get cluster durability.
+// In distributed mode, object data is erasure-coded across the peer set and
+// metadata is replicated to the same placement group. Multipart uploads are
+// assembled locally, promoted into the EC ring on CompleteMultipartUpload, and
+// the local assembled copy is dropped after promotion.
 
 fn clusterPutObject(ctx: HandlerContext, cr: *cluster.ClusterRuntime, bucket: []const u8, key: []const u8, req: *http.Request) http.Response {
     if (req.header("x-amz-copy-source")) |raw_src| {

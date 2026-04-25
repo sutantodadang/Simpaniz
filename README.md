@@ -11,7 +11,7 @@ operation matrix and [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the design.
 - **S3 API** — bucket CRUD, object PUT/GET/HEAD/DELETE, CopyObject,
   Bulk Delete (`POST ?delete`), `ListObjectsV2` with full pagination
   (`prefix`, `delimiter`, `max-keys`, `continuation-token`, `start-after`,
-  `CommonPrefixes`), `Range` GET (`206 Partial Content`), conditional
+  `CommonPrefixes`), `Range` GET including suffix ranges (`206 Partial Content`), conditional
   GET/HEAD (`If-Match` / `If-None-Match` / `If-Modified-Since` /
   `If-Unmodified-Since`), full **multipart upload** (Initiate /
   UploadPart / Complete / Abort / List, AWS-compatible composite
@@ -175,27 +175,40 @@ DATA_DIR/
   <bucket>/
     .simpaniz-meta/<key>.json     content type, etag, size, mtime
     .simpaniz-mp/<uploadId>/      multipart staging
-    .simpaniz-tmp/                in-flight uploads (auto-cleaned)
+    .simpaniz-tmp/                in-flight/orphaned upload temp files
+    .simpaniz-tags/<key>.xml      object tag set XML
+    .simpaniz-versions/           version snapshots and delete markers
+    .simpaniz-lock/               object retention metadata
+    .simpaniz-hold/               legal hold metadata
+    .simpaniz-repl/queue.log      cross-cluster replication journal
     <key>                       object data
     <prefix>/<key>              nested keys reflect on-disk hierarchy
 ```
 
-## What's deferred (not in this release)
+## Known gaps toward MinIO-level
 
 These are real engineering investments — they're documented as
-future work, not "coming soon":
+current limits, not "coming soon":
 
 - **TLS in-process** — terminate at a reverse proxy.
-- **Multi-user IAM, policies, ACLs.**
-- **Server-side encryption** (SSE-S3, SSE-KMS, SSE-C). Use full-disk
-  encryption.
-- **Object Lock, Lifecycle, Versioning.**
-- **Replication and event notifications.**
-- **Distributed mode + erasure coding** (single-node only today).
+- **Multi-user IAM, policy enforcement, ACLs, STS.** Bucket policies are
+  stored but not enforced.
+- **SSE completeness.** SSE-S3 exists for single PUT/GET, but multipart,
+  copy-source, default bucket encryption, Range GET on encrypted objects,
+  SSE-KMS, and SSE-C are not complete.
+- **Versioning/lifecycle/object-lock completeness.** Core flows exist, but
+  suspended versioning, lifecycle transitions/noncurrent expiry/tag filters,
+  and full AWS Object Lock semantics are partial.
+- **Cluster maturity.** Static peer lists, no rebalance/gossip/Raft, no active
+  health probing, full-object EC buffers on PUT/GET, and limited cluster-mode
+  support for advanced bucket features.
+- **Replication maturity.** Cross-cluster replication is best-effort async;
+  event notifications are not implemented.
+- **Large-bucket indexing.** Listings walk and sort the filesystem in memory;
+  a real metadata/index layer is needed for millions of keys.
 
 These are what turn an "S3-compatible server" into a "distributed
-object store like MinIO" — they're not blockers for single-node
-production use behind a proxy.
+object store like MinIO" — they're not one-line polish items.
 
 ## Requirements
 

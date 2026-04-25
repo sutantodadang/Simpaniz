@@ -26,7 +26,7 @@ Status legend:
 | ------------------------------------------ | :----: | -------------------------------------------------------- |
 | `PutObject`                                |   ✅   | Streamed; `Content-MD5` & `x-amz-content-sha256` checked. |
 | `GetObject`                                |   ✅   | Zero-copy file streaming.                                 |
-| `GetObject` with `Range`                   |   ✅   | `bytes=start-end` and `bytes=start-`. `206 Partial Content`. |
+| `GetObject` with `Range`                   |   ✅   | `bytes=start-end`, `bytes=start-`, and suffix ranges (`bytes=-N`). `206 Partial Content`. |
 | `HeadObject`                               |   ✅   |                                                          |
 | `DeleteObject`                             |   ✅   | Removes data, metadata, and now-empty parent dirs.        |
 | `DeleteObjects` (`POST ?delete`)           |   ✅   |                                                          |

@@ -102,12 +102,16 @@ filtered out of bucket listings and bucket-empty checks.
   loop exits after the current `accept()` unblocks; in-flight
   connections drain naturally (the test rig waits for them).
 
-## Where it deviates from MinIO (intentional, deferred)
+## Where it still deviates from MinIO
 
 - No in-process TLS — terminate with a reverse proxy.
-- No IAM, policies, SSE-S3/KMS/C, Object Lock, Lifecycle.
-- No bucket / site replication, no event notifications.
-- No distributed mode, no erasure coding (single-node only).
+- No multi-user IAM, policy enforcement, ACLs, or STS.
+- SSE-S3, Object Lock, Lifecycle, Versioning, and replication exist only for
+  selected flows; see `COMPATIBILITY.md` for the exact matrix.
+- Distributed erasure-coded mode exists, but uses static membership, has no
+  rebalance/gossip/Raft, and still buffers full EC objects during cluster
+  PUT/GET paths.
+- No event notifications.
 - Listings are walked in memory (no on-disk index).
 - Connection model is thread-per-conn, not evented.
 
@@ -133,9 +137,9 @@ multi-node erasure-coded storage:
   node leaves placement undisturbed.
 - `transport.zig` — Pluggable shard transport (vtable). The
   `LocalTransport` impl writes shards under one subdirectory per
-  "node" and is what drives unit tests. An HTTP transport that
-  reaches peers over the internal `/_simpaniz/shards/...` endpoint
-  is the next phase.
+  "node" and is what drives unit tests. The HTTP transport reaches
+  peers over internal `/_simpaniz/...` endpoints and short-circuits
+  self-node traffic to local disk.
 - `orchestrator.zig` — End-to-end distributed object I/O. PUT
   encodes `data → k+m shards` (last data shard zero-padded to
   `shard_size = ceil(orig_size / k)`), maps each shard to a node
@@ -147,12 +151,11 @@ multi-node erasure-coded storage:
   `SIMPANIZ_NODE_ID` or `SIMPANIZ_PEERS` is empty the server falls
   back to standalone single-node behaviour.
 
-What is **not yet wired**:
+Remaining distributed-mode gaps:
 
-- HTTP shard transport between peers (handler endpoints +
-  blocking client). Local transport ships and is unit-tested
-  against scatter/gather/heal.
-- Switching `handlers.putObject` / `getObject` / `deleteObject`
-  onto the orchestrator when `cluster.enabled` is true. Today the
-  orchestrator is a tested library with no request-path callers.
-- Cross-cluster replication and gossip-based membership.
+- Streaming EC encode/decode and response streaming instead of full-object
+  buffers in the cluster PUT/GET path.
+- Active health probing, topology changes, rebalance, and stronger membership.
+- Advanced feature parity in cluster mode, including version listings and the
+  full SSE/versioning/lifecycle/object-lock matrix.
+- Event notifications and stronger replication conflict/ordering semantics.

@@ -4,9 +4,9 @@
 
 - **In scope** — request smuggling, path traversal, unauthorised access via
   forged signatures, request-size DoS, slowloris.
-- **Out of scope (deferred)** — at-rest encryption, key management,
-  fine-grained IAM, multi-tenant isolation, audit logging beyond
-  access logs.
+- **Out of scope / partial** — external key management, fine-grained IAM,
+  multi-tenant isolation, audit logging beyond access logs, and complete
+  SSE coverage for multipart/copy/range flows.
 
 ## Network exposure
 
@@ -88,16 +88,19 @@ Header parsing aborts immediately on:
 
 - **Atomic writes** — every PUT writes to `.simpaniz-tmp/upload-XXXX`,
   fsyncs the file, and renames into place. Crashes mid-write leave
-  only orphaned tmp files (cleaned on next bucket touch by the
-  background reaper — TODO).
+  only orphaned tmp files; an automatic stale-temp reaper is still a
+  durability/operations TODO.
 - **No silent corruption** — if a `Content-MD5` or
   `x-amz-content-sha256` header is supplied, Simpaniz verifies the
   body digest and returns `400 BadDigest` on mismatch.
 
 ## What Simpaniz does NOT do (yet)
 
-- **No at-rest encryption.** Use full-disk encryption (LUKS, BitLocker,
-  EBS encryption) on the data volume.
+- **No external key management.** SSE-S3 can be enabled with
+  `SIMPANIZ_MASTER_KEY`, but KMS integration, SSE-C, key rotation, and full
+  encrypted multipart/copy/range support are not complete. Use full-disk
+  encryption (LUKS, BitLocker, EBS encryption) on the data volume for broader
+  protection.
 - **No audit log retention policy.** The JSON access log is written
   to stderr; route it to your log infra.
 - **No rate limiting.** Use the reverse proxy.
