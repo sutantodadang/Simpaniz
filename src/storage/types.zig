@@ -43,6 +43,12 @@ pub const ObjectMeta = struct {
     mtime_ns: i128,
     /// Set when the object is stored encrypted (SSE-S3).
     encryption: ?EncryptionInfo = null,
+    /// Lifecycle Transition target, e.g. "GLACIER"/"COLD". Empty when the
+    /// object has never been transitioned.
+    storage_class: []const u8 = "",
+    /// True once lifecycle has moved this object's bytes to a cold tier and
+    /// replaced the local file with a zero-byte stub (see tiering.zig).
+    tiered: bool = false,
 };
 
 pub const BucketSummary = struct {

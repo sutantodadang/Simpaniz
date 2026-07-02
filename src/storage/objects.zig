@@ -279,6 +279,7 @@ pub fn copyObject(
     defer {
         allocator.free(src_meta.content_type);
         allocator.free(src_meta.etag);
+        allocator.free(src_meta.storage_class);
         if (src_meta.encryption) |e| {
             allocator.free(e.alg);
             allocator.free(e.wrapped_dek_b64);
@@ -480,6 +481,7 @@ fn freeMeta(a: Allocator, meta: ObjectMeta) void {
 fn freeReadMeta(a: Allocator, meta: ObjectMeta) void {
     a.free(meta.content_type);
     a.free(meta.etag);
+    a.free(meta.storage_class);
     if (meta.encryption) |e| {
         a.free(e.alg);
         a.free(e.wrapped_dek_b64);

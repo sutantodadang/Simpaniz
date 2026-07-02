@@ -19,6 +19,8 @@ const iam = @import("iam.zig");
 const events = @import("events.zig");
 const tls_server = @import("tls_server.zig");
 const index_mod = @import("index.zig");
+const tiering_mod = @import("tiering.zig");
+const sts = @import("sts.zig");
 
 const DaemonCtx = struct {
     data_dir: std.fs.Dir,
@@ -28,6 +30,8 @@ const DaemonCtx = struct {
     /// Only set for the lifecycle sweeper — background expirations must also
     /// remove the expired key from the persistent listing index.
     index: ?*index_mod.Manager = null,
+    /// Only set for the lifecycle sweeper — drives Transition rules.
+    tiering: ?*tiering_mod.Tiering = null,
 };
 
 const HealDaemonCtx = struct {
@@ -106,12 +110,14 @@ fn lifecycleLoop(c: *DaemonCtx) void {
         std.Thread.sleep(c.interval_ns);
         if (shutdown_requested.load(.seq_cst)) break;
         const now: i128 = std.time.nanoTimestamp();
-        const stats = storage.sweepLifecycle(c.data_dir, c.gpa, now, c.index) catch |e| {
+        const stats = storage.sweepLifecycle(c.data_dir, c.gpa, now, c.index, c.tiering) catch |e| {
             std.log.warn("lifecycle sweep failed: {}", .{e});
             continue;
         };
         c.registry.lifecycle_expirations_total.add(stats.expired);
-        if (stats.expired > 0) std.log.info("lifecycle: expired={d}", .{stats.expired});
+        if (stats.expired > 0 or stats.noncurrent_expired > 0 or stats.transitioned > 0) {
+            std.log.info("lifecycle: expired={d} noncurrent_expired={d} transitioned={d}", .{ stats.expired, stats.noncurrent_expired, stats.transitioned });
+        }
     }
 }
 
@@ -170,6 +176,13 @@ pub const Context = struct {
     /// Persistent object-listing index, single-node only (null in cluster
     /// mode — cluster listing still walks the shard-local metadata).
     index: ?*index_mod.Manager = null,
+    /// Cold-storage tiering target for lifecycle Transition rules, or null
+    /// when no tier target is configured.
+    tiering: ?*tiering_mod.Tiering = null,
+    /// STS temp-credential store (AssumeRole / AssumeRoleWithWebIdentity).
+    sts: *sts.StsStore,
+    /// OIDC config for AssumeRoleWithWebIdentity.
+    oidc: *sts.OidcConfig,
 };
 
 pub fn requestShutdown() void {
@@ -228,7 +241,7 @@ pub fn start(ctx: Context) !void {
     }
     if (ctx.config.lifecycle_interval_s > 0) {
         if (ctx.gpa.create(DaemonCtx)) |dc| {
-            dc.* = .{ .data_dir = ctx.data_dir, .gpa = ctx.gpa, .registry = ctx.registry, .interval_ns = ctx.config.lifecycle_interval_s * std.time.ns_per_s, .index = ctx.index };
+            dc.* = .{ .data_dir = ctx.data_dir, .gpa = ctx.gpa, .registry = ctx.registry, .interval_ns = ctx.config.lifecycle_interval_s * std.time.ns_per_s, .index = ctx.index, .tiering = ctx.tiering };
             if (std.Thread.spawn(.{}, lifecycleLoop, .{dc})) |t| {
                 t.detach();
                 std.log.info("lifecycle daemon enabled (interval={d}s)", .{ctx.config.lifecycle_interval_s});
@@ -403,9 +416,15 @@ fn serveHttp(in: *Io.Reader, out: *Io.Writer, ctx: Context) void {
         }
 
         // Auth (best-effort SigV4 verification when configured).
+        // AssumeRoleWithWebIdentity is unsigned by design (STS): identity
+        // comes from the OIDC JWT it carries, verified inside the handler.
+        // AssumeRole stays fully SigV4-signed like every other endpoint.
+        const is_unsigned_sts = std.mem.eql(u8, request.path, "/") and
+            queryHasParamValue(request.query, "Action", "AssumeRoleWithWebIdentity");
+
         var principal: ?iam.Principal = null;
-        if (ctx.config.auth_required) {
-            principal = verifyRequestAuth(&request, ctx.config, ctx.iam) catch null;
+        if (ctx.config.auth_required and !is_unsigned_sts) {
+            principal = verifyRequestAuth(&request, ctx.config, ctx.iam, ctx.sts) catch null;
             if (principal == null) {
                 ctx.registry.auth_failures.inc();
                 writeAuthError(out, request_id);
@@ -418,8 +437,11 @@ fn serveHttp(in: *Io.Reader, out: *Io.Writer, ctx: Context) void {
         // Policy enforcement (skip root; skip metrics/health/console/cluster
         // paths, which are either bypassed above or exempt below). Runs even
         // when auth is not required so anonymous mode still honors an
-        // explicit bucket-policy Deny.
-        if (!isExemptPath(request.path)) {
+        // explicit bucket-policy Deny. STS's own dispatch (POST / with an
+        // Action= query param) enforces its own auth inside the handler:
+        // AssumeRole requires a non-null principal itself, and
+        // AssumeRoleWithWebIdentity is unsigned/anonymous by design.
+        if (!isExemptPath(request.path) and !isStsRequest(request.path, request.method, request.query)) {
             var b: []const u8 = "";
             var k: []const u8 = "";
             router.splitBucketKey(&request, &b, &k);
@@ -448,6 +470,13 @@ fn serveHttp(in: *Io.Reader, out: *Io.Writer, ctx: Context) void {
             .max_body_bytes = ctx.config.max_body_bytes,
             .notifier = ctx.notifier,
             .index = ctx.index,
+            .tiering = ctx.tiering,
+            .sts_store = ctx.sts,
+            .oidc = ctx.oidc,
+            .principal = principal,
+            .iam = ctx.iam,
+            .config = ctx.config,
+            .started_unix = ctx.registry.started_unix,
         };
 
         // Special: /metrics (needs registry).
@@ -568,7 +597,38 @@ fn isExemptPath(path: []const u8) bool {
         std.mem.eql(u8, path, "/readyz") or
         std.mem.eql(u8, path, "/metrics") or
         std.mem.eql(u8, path, "/cluster/health") or
-        std.mem.eql(u8, path, "/_simpaniz/cluster/health");
+        std.mem.eql(u8, path, "/_simpaniz/cluster/health") or
+        // Admin API does its own root-only check (see admin.zig); it isn't
+        // an S3 bucket/key operation so the generic bucket-policy mapping
+        // doesn't apply. SigV4 auth (above) still runs unconditionally.
+        std.mem.startsWith(u8, path, "/_admin/");
+}
+
+/// True for the STS dispatch endpoint: `POST /` with an `Action=` query
+/// param. Used to keep the generic bucket/key IAM policy-enforcement block
+/// from running on a request that has neither — STS handlers enforce their
+/// own auth (see `handlers.sts`).
+fn isStsRequest(path: []const u8, method: http.Method, query: []const u8) bool {
+    if (method != .POST or !std.mem.eql(u8, path, "/")) return false;
+    return queryHasParamName(query, "Action");
+}
+
+fn queryHasParamName(query: []const u8, name: []const u8) bool {
+    var iter = std.mem.splitScalar(u8, query, '&');
+    while (iter.next()) |param| {
+        const pname = if (std.mem.indexOfScalar(u8, param, '=')) |eq| param[0..eq] else param;
+        if (std.mem.eql(u8, pname, name)) return true;
+    }
+    return false;
+}
+
+fn queryHasParamValue(query: []const u8, name: []const u8, value: []const u8) bool {
+    var iter = std.mem.splitScalar(u8, query, '&');
+    while (iter.next()) |param| {
+        const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+        if (std.mem.eql(u8, param[0..eq], name) and std.mem.eql(u8, param[eq + 1 ..], value)) return true;
+    }
+    return false;
 }
 
 fn writeAccessDenied(w: *Io.Writer, request_id: []const u8) void {
@@ -592,7 +652,7 @@ fn drainBody(req: *http.Request) !void {
     }
 }
 
-fn verifyRequestAuth(req: *const http.Request, config: *const Config, iam_store: *const iam.Store) !?iam.Principal {
+fn verifyRequestAuth(req: *const http.Request, config: *const Config, iam_store: *const iam.Store, sts_store: *sts.StsStore) !?iam.Principal {
     const auth_hdr = req.header("authorization") orelse return null;
     if (!std.mem.startsWith(u8, auth_hdr, "AWS4-HMAC-SHA256 ")) return null;
 
@@ -606,8 +666,10 @@ fn verifyRequestAuth(req: *const http.Request, config: *const Config, iam_store:
 
     const parsed = auth.parseAuthorization(auth_hdr) catch return null;
 
-    // Resolve which credentials to verify against: root config keys, or a
-    // matching IAM user's keys. Unknown access keys fail closed.
+    // Resolve which credentials to verify against: root config keys, a
+    // matching IAM user's keys, or (for "STS"-prefixed access keys, which
+    // must carry the x-amz-security-token header) an STS temp credential's
+    // secret. Unknown access keys fail closed.
     var creds: auth.Credentials = undefined;
     var principal: iam.Principal = undefined;
     if (std.mem.eql(u8, parsed.access_key, config.access_key)) {
@@ -616,6 +678,11 @@ fn verifyRequestAuth(req: *const http.Request, config: *const Config, iam_store:
     } else if (iam_store.findUser(parsed.access_key)) |user| {
         creds = .{ .access_key = user.access_key, .secret_key = user.secret_key, .region = config.region };
         principal = .{ .access_key = user.access_key, .is_root = false };
+    } else if (std.mem.startsWith(u8, parsed.access_key, "STS")) {
+        const token = req.header("x-amz-security-token") orelse return null;
+        const cred = sts_store.lookup(parsed.access_key, token) orelse return null;
+        creds = .{ .access_key = &cred.access_key, .secret_key = &cred.secret_key, .region = config.region };
+        principal = .{ .access_key = cred.base_principal, .is_root = cred.is_root_base, .session_policy = cred.session_policy };
     } else {
         return null;
     }
@@ -683,4 +750,150 @@ fn canonicalizeQuery(allocator: Allocator, raw: []const u8) ![]u8 {
         allocator.free(p.v);
     }
     return out.toOwnedSlice(allocator);
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+test "verifyRequestAuth resolves STS temp credential with session policy" {
+    const a = std.testing.allocator;
+
+    var config = Config{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .host = "0.0.0.0",
+        .port = 9000,
+        .data_dir = "./data",
+        .region = "us-east-1",
+        .access_key = "ROOTKEY",
+        .secret_key = "ROOTSECRET",
+        .max_body_bytes = 0,
+        .idle_timeout_ms = 0,
+        .read_timeout_ms = 0,
+        .max_header_bytes = 16 * 1024,
+        .max_headers = 64,
+        .auth_required = true,
+        .master_key = .{0} ** 32,
+        .master_key_set = false,
+        .max_conns = 1,
+        .scrub_interval_s = 0,
+        .lifecycle_interval_s = 0,
+        .heal_interval_s = 0,
+        .tls_cert_path = "",
+        .tls_key_path = "",
+    };
+    defer config.deinit();
+
+    var iam_store = iam.Store{ .arena = std.heap.ArenaAllocator.init(a), .users = &.{} };
+    defer iam_store.deinit();
+
+    var sts_store = sts.StsStore.init(a);
+    defer sts_store.deinit();
+
+    const session_policy =
+        \\{"Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::b/*"}]}
+    ;
+    const cred = try sts_store.issue("ROOTKEY", true, session_policy, 3600);
+
+    const canon_headers = [_]auth.Header{
+        .{ .name = "host", .value = "h" },
+        .{ .name = "x-amz-date", .value = "20240101T000000Z" },
+        .{ .name = "x-amz-security-token", .value = cred.session_token },
+    };
+    const cr = try auth.buildCanonicalRequest(a, "GET", "/b/x", "", &canon_headers, "host;x-amz-date;x-amz-security-token", auth.unsigned_payload);
+    defer a.free(cr);
+    const string_to_sign = try auth.buildStringToSign(a, "20240101T000000Z", "20240101", "us-east-1", "s3", cr);
+    defer a.free(string_to_sign);
+    const sig = auth.computeSignature(&cred.secret_key, "20240101", "us-east-1", "s3", string_to_sign);
+
+    var auth_buf: [512]u8 = undefined;
+    const auth_value = try std.fmt.bufPrint(&auth_buf, "{s} Credential={s}/20240101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date;x-amz-security-token, Signature={s}", .{ auth.algorithm, &cred.access_key, &sig });
+
+    const req_headers = [_]http.Header{
+        .{ .name = "host", .value = "h" },
+        .{ .name = "x-amz-date", .value = "20240101T000000Z" },
+        .{ .name = "x-amz-security-token", .value = cred.session_token },
+        .{ .name = "authorization", .value = auth_value },
+        .{ .name = "x-amz-content-sha256", .value = auth.unsigned_payload },
+    };
+
+    var req: http.Request = undefined;
+    req.method = .GET;
+    req.raw_path = "/b/x";
+    req.path = "/b/x";
+    req.query = "";
+    req.headers = @constCast(&req_headers);
+
+    const principal = try verifyRequestAuth(&req, &config, &iam_store, &sts_store);
+    try std.testing.expect(principal != null);
+    try std.testing.expectEqualStrings("ROOTKEY", principal.?.access_key);
+    try std.testing.expect(principal.?.is_root);
+    try std.testing.expect(principal.?.session_policy != null);
+}
+
+test "verifyRequestAuth rejects STS credential with wrong token" {
+    const a = std.testing.allocator;
+
+    var config = Config{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .host = "0.0.0.0",
+        .port = 9000,
+        .data_dir = "./data",
+        .region = "us-east-1",
+        .access_key = "ROOTKEY",
+        .secret_key = "ROOTSECRET",
+        .max_body_bytes = 0,
+        .idle_timeout_ms = 0,
+        .read_timeout_ms = 0,
+        .max_header_bytes = 16 * 1024,
+        .max_headers = 64,
+        .auth_required = true,
+        .master_key = .{0} ** 32,
+        .master_key_set = false,
+        .max_conns = 1,
+        .scrub_interval_s = 0,
+        .lifecycle_interval_s = 0,
+        .heal_interval_s = 0,
+        .tls_cert_path = "",
+        .tls_key_path = "",
+    };
+    defer config.deinit();
+
+    var iam_store = iam.Store{ .arena = std.heap.ArenaAllocator.init(a), .users = &.{} };
+    defer iam_store.deinit();
+
+    var sts_store = sts.StsStore.init(a);
+    defer sts_store.deinit();
+
+    const cred = try sts_store.issue("ROOTKEY", true, null, 3600);
+
+    const canon_headers = [_]auth.Header{
+        .{ .name = "host", .value = "h" },
+        .{ .name = "x-amz-date", .value = "20240101T000000Z" },
+        .{ .name = "x-amz-security-token", .value = "totally-wrong-token-0000000000000000000000" },
+    };
+    const cr = try auth.buildCanonicalRequest(a, "GET", "/b/x", "", &canon_headers, "host;x-amz-date;x-amz-security-token", auth.unsigned_payload);
+    defer a.free(cr);
+    const string_to_sign = try auth.buildStringToSign(a, "20240101T000000Z", "20240101", "us-east-1", "s3", cr);
+    defer a.free(string_to_sign);
+    const sig = auth.computeSignature(&cred.secret_key, "20240101", "us-east-1", "s3", string_to_sign);
+
+    var auth_buf: [512]u8 = undefined;
+    const auth_value = try std.fmt.bufPrint(&auth_buf, "{s} Credential={s}/20240101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date;x-amz-security-token, Signature={s}", .{ auth.algorithm, &cred.access_key, &sig });
+
+    const req_headers = [_]http.Header{
+        .{ .name = "host", .value = "h" },
+        .{ .name = "x-amz-date", .value = "20240101T000000Z" },
+        .{ .name = "x-amz-security-token", .value = "totally-wrong-token-0000000000000000000000" },
+        .{ .name = "authorization", .value = auth_value },
+        .{ .name = "x-amz-content-sha256", .value = auth.unsigned_payload },
+    };
+
+    var req: http.Request = undefined;
+    req.method = .GET;
+    req.raw_path = "/b/x";
+    req.path = "/b/x";
+    req.query = "";
+    req.headers = @constCast(&req_headers);
+
+    const principal = try verifyRequestAuth(&req, &config, &iam_store, &sts_store);
+    try std.testing.expect(principal == null);
 }
