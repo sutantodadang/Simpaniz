@@ -12,7 +12,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # macos-14 pinned: macos-latest ships Xcode 26.4 whose SDK breaks
+        # Zig 0.15.2 linking (undefined __availability_version_check etc.);
+        # see ziglang/zig#31658. Bump back to macos-latest when a fixed Zig
+        # release lands.
+        os: [ubuntu-latest, windows-latest, macos-14]
     steps:
       - uses: actions/checkout@v4
 

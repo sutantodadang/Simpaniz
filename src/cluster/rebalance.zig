@@ -100,16 +100,17 @@ fn visit(raw: *anyopaque, bucket: []const u8, key: []const u8) anyerror!void {
         ctx.stats.errors += 1;
         return;
     };
-    if (moved) {
-        ctx.stats.moved += 1;
-        ctx.stats.deleted += 1;
-    }
+    ctx.stats.moved += moved;
+    ctx.stats.deleted += moved;
 }
 
-/// If `self_index` currently holds a shard for (bucket, key) that current
-/// placement no longer assigns to it, migrate it to the new owner and
-/// return `true`. Returns `false` when there is nothing to do (no local
-/// shard, or the local shard's placement hasn't changed).
+/// Migrate every shard of (bucket, key) that `self_index` currently holds
+/// but current placement no longer assigns to it. Returns the number of
+/// shards migrated. A node can hold MORE than one shard of the same key
+/// mid-rebalance (an earlier peer's sweep may push a shard here before our
+/// own sweep runs), so every index must be examined — checking a single
+/// index strands the others (directory-iteration order made this
+/// Windows-pass/Linux-fail flaky before).
 fn migrateKeyCore(
     allocator: Allocator,
     orch: *Orchestrator,
@@ -118,18 +119,41 @@ fn migrateKeyCore(
     self_index: usize,
     bucket: []const u8,
     key: []const u8,
-) !bool {
-    const local_idx = (try disk.localShardIndex(data_dir, bucket, key)) orelse return false;
-
+) !u64 {
     const total = orch.codec.shardCount();
     var place_buf: [32]usize = undefined;
     if (total > place_buf.len) return error.TooManyShards;
     const place = place_buf[0..total];
     try orch.placement(bucket, key, place);
 
-    if (local_idx >= total) return false; // stale/corrupt index, leave for scrub
-    const new_owner = place[local_idx];
+    var moved: u64 = 0;
+    for (0..total) |idx| {
+        const local_idx: u8 = @intCast(idx);
+        if (migrateShard(allocator, transport, data_dir, self_index, bucket, key, local_idx, place[idx])) |did| {
+            if (did) moved += 1;
+        } else |e| return e;
+    }
+    return moved;
+}
+
+/// Migrate one locally-held shard to `new_owner` if misplaced. Returns
+/// `true` when a shard was copied+verified+deleted, `false` when there is
+/// nothing to do (shard not held locally, or already correctly placed).
+fn migrateShard(
+    allocator: Allocator,
+    transport: Transport,
+    data_dir: std.fs.Dir,
+    self_index: usize,
+    bucket: []const u8,
+    key: []const u8,
+    local_idx: u8,
+    new_owner: usize,
+) !bool {
     if (new_owner == self_index) return false; // still correctly placed
+    const local_len = disk.statShard(data_dir, bucket, key, local_idx) catch |e| switch (e) {
+        error.ShardMissing => return false, // we don't hold this index
+        else => return e,
+    };
 
     const meta_bytes = (try disk.getMeta(data_dir, bucket, key, allocator)) orelse return false;
     defer allocator.free(meta_bytes);
@@ -137,7 +161,6 @@ fn migrateKeyCore(
     defer allocator.free(meta.content_type);
     if (meta.shard_size == 0) return error.InvalidMeta;
 
-    const local_len = try disk.statShard(data_dir, bucket, key, local_idx);
     const sid: ShardId = .{ .bucket = bucket, .key = key, .index = local_idx };
 
     const already: u64 = transport.statShard(new_owner, sid) catch 0;
@@ -354,6 +377,71 @@ fn countShardFiles(dirs: []std.fs.Dir) !usize {
         }
     }
     return total;
+}
+
+test "rebalance migrates every misplaced shard when a node holds several of one key" {
+    // Regression: mid-rebalance a node can hold MORE than one shard of a
+    // key (a peer's sweep pushed one here before ours ran). The old code
+    // examined only one directory-iteration-ordered index per key, so
+    // whether the second shard migrated depended on filesystem iteration
+    // order (NTFS sorted = pass, ext4 hash order = flaky strand). This
+    // test constructs that state directly, order-independently.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dirs: [2]std.fs.Dir = undefined;
+    for (0..2) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "node{d}", .{i});
+        try tmp.dir.makePath(name);
+        dirs[i] = try tmp.dir.openDir(name, .{ .iterate = true });
+    }
+    defer for (&dirs) |*d| d.close();
+
+    var mt: DiskMultiTransport = .{ .dirs = &dirs };
+    const t = mt.transport();
+
+    const nodes = [_][]const u8{ "n0", "n1" };
+    var orch = try Orchestrator.init(std.testing.allocator, &nodes, 1, 1, t);
+    defer orch.deinit();
+
+    // Find a key whose placement is [n0, n1] so shard0 belongs on n0 and
+    // shard1 on n1 (deterministic search, HRW is stable).
+    var key_buf: [32]u8 = undefined;
+    var key: []const u8 = "";
+    var place: [2]usize = undefined;
+    for (0..64) |i| {
+        key = try std.fmt.bufPrint(&key_buf, "seek-{d}", .{i});
+        try orch.placement("buk", key, &place);
+        if (place[0] == 0 and place[1] == 1) break;
+    }
+    try std.testing.expectEqual(@as(usize, 0), place[0]);
+    try std.testing.expectEqual(@as(usize, 1), place[1]);
+
+    // Node 0 holds BOTH shards; shard0 is correctly placed, shard1 is not.
+    const chunk: usize = 8;
+    const shard_bytes = "8bytes!!";
+    try disk.putShard(dirs[0], "buk", key, 0, shard_bytes);
+    try disk.putShard(dirs[0], "buk", key, 1, shard_bytes);
+    const meta: runtime_mod.ObjectMeta = .{
+        .shard_size = chunk,
+        .original_size = chunk,
+        .etag = "0123456789abcdef0123456789abcdef".*,
+        .content_type = "application/octet-stream",
+        .last_modified = 0,
+    };
+    const json = try meta.toJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try disk.putMeta(dirs[0], "buk", key, json);
+
+    const stats = try runOnceCore(std.testing.allocator, &orch, t, dirs[0], 0);
+    try std.testing.expectEqual(@as(u64, 1), stats.moved);
+    try std.testing.expectEqual(@as(u64, 0), stats.errors);
+
+    // shard1 now at n1, gone from n0; shard0 untouched at n0.
+    try std.testing.expectEqual(@as(u64, chunk), try t.statShard(1, .{ .bucket = "buk", .key = key, .index = 1 }));
+    try std.testing.expectError(error.ShardMissing, disk.statShard(dirs[0], "buk", key, 1));
+    try std.testing.expectEqual(@as(u64, chunk), try disk.statShard(dirs[0], "buk", key, 0));
 }
 
 test "rebalance is a no-op when placement is unchanged" {
