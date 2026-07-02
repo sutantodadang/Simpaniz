@@ -19,12 +19,18 @@ const config_mod = @import("config.zig");
 const ClusterConfig = config_mod.ClusterConfig;
 const Peer = config_mod.Peer;
 const disk = @import("disk_store.zig");
+const membership_mod = @import("membership.zig");
+const Membership = membership_mod.Membership;
 
 pub const HttpTransport = struct {
     allocator: Allocator,
     cfg: *const ClusterConfig,
     data_dir: std.fs.Dir,
     metrics: ?*Metrics = null,
+    /// Set after construction (see `ClusterRuntime.init`). Consulted by
+    /// `peerOf` to resolve host:port for node indices beyond the static
+    /// `cfg.peers` list — i.e. nodes that joined dynamically at runtime.
+    membership: ?*Membership = null,
 
     pub const Metrics = struct {
         peer_unreachable: std.atomic.Value(u64) = .{ .raw = 0 },
@@ -52,6 +58,9 @@ pub const HttpTransport = struct {
             .putMeta = putMetaVT,
             .getMeta = getMetaVT,
             .deleteMeta = deleteMetaVT,
+            .appendShardChunk = appendShardChunkVT,
+            .getShardRange = getShardRangeVT,
+            .statShard = statShardVT,
         } };
     }
 
@@ -60,8 +69,60 @@ pub const HttpTransport = struct {
     }
 
     fn peerOf(self: *HttpTransport, node: usize) !Peer {
-        if (node >= self.cfg.peers.len) return error.InvalidNode;
-        return self.cfg.peers[node];
+        if (node < self.cfg.peers.len) return self.cfg.peers[node];
+        if (self.membership) |mem| {
+            if (mem.hostPortOf(node)) |hp| return .{ .id = "", .host = hp.host, .port = hp.port };
+        }
+        return error.InvalidNode;
+    }
+
+    /// Probe `node` and return its membership snapshot JSON body (caller
+    /// frees with `allocator`). Used by the `Membership` prober thread.
+    pub fn ping(self: *HttpTransport, node: usize, allocator: Allocator) ![]u8 {
+        const peer = try self.peerOf(node);
+        const r = try self.doRequest(peer, "GET", "/_simpaniz/ping", "", true);
+        switch (r) {
+            .not_found => return error.PeerError,
+            .ok => |bytes| {
+                const out = try allocator.alloc(u8, bytes.len);
+                @memcpy(out, bytes);
+                self.allocator.free(bytes);
+                return out;
+            },
+        }
+    }
+
+    fn pingPingerFn(ctx: *anyopaque, node_idx: usize, allocator: Allocator) anyerror![]u8 {
+        const self: *HttpTransport = @ptrCast(@alignCast(ctx));
+        return self.ping(node_idx, allocator);
+    }
+
+    /// Adapter handing this transport's `ping` to `Membership.start` without
+    /// `membership.zig` needing to depend on `HttpTransport`.
+    pub fn pinger(self: *HttpTransport) membership_mod.Pinger {
+        return .{ .ctx = self, .pingFn = pingPingerFn };
+    }
+
+    /// Announce this node to `node` via the internal join endpoint. Returns
+    /// the peer's membership snapshot JSON body (caller frees).
+    pub fn join(self: *HttpTransport, node: usize, self_id: []const u8, self_host: []const u8, self_port: u16, allocator: Allocator) ![]u8 {
+        const peer = try self.peerOf(node);
+        var body_buf: [512]u8 = undefined;
+        const body = try std.fmt.bufPrint(
+            &body_buf,
+            "{{\"id\":\"{s}\",\"host\":\"{s}\",\"port\":{d}}}",
+            .{ self_id, self_host, self_port },
+        );
+        const r = try self.doRequest(peer, "POST", "/_simpaniz/join", body, true);
+        switch (r) {
+            .not_found => return error.PeerError,
+            .ok => |bytes| {
+                const out = try allocator.alloc(u8, bytes.len);
+                @memcpy(out, bytes);
+                self.allocator.free(bytes);
+                return out;
+            },
+        }
     }
 
     /// Replicate a bucket op (PUT / DELETE) to a single peer. Idempotent
@@ -128,6 +189,66 @@ pub const HttpTransport = struct {
         const path = try std.fmt.bufPrint(&pb, "/_simpaniz/shards/{s}/{s}/{d}", .{ sid.bucket, sid.key, sid.index });
         const peer = try self.peerOf(node);
         _ = try self.doRequest(peer, "DELETE", path, "", false);
+    }
+
+    // ponytail: chunk-append/range-read/stat each open a fresh short-lived
+    // TCP connection per call (same as putShard/getShard above) — no
+    // keep-alive pooling in v1. Acceptable: stripe chunks are ~1 MiB so the
+    // connection-setup overhead is amortized; revisit if profiling shows
+    // connect() dominating cluster PUT/GET latency.
+    fn appendShardChunkVT(ctx: *anyopaque, node: usize, sid: ShardId, seq: u64, data: []const u8) anyerror!void {
+        const self: *HttpTransport = @ptrCast(@alignCast(ctx));
+        if (self.isSelf(node)) return disk.appendShardChunk(self.data_dir, sid.bucket, sid.key, sid.index, seq, data);
+        var pb: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "/_simpaniz/shards/{s}/{s}/{d}?seq={d}", .{ sid.bucket, sid.key, sid.index, seq });
+        const peer = try self.peerOf(node);
+        _ = self.doRequest(peer, "PUT", path, data, false) catch |e| {
+            if (self.metrics) |m| _ = m.shard_put_err.fetchAdd(1, .monotonic);
+            return e;
+        };
+        if (self.metrics) |m| _ = m.shard_put_ok.fetchAdd(1, .monotonic);
+    }
+
+    fn getShardRangeVT(ctx: *anyopaque, node: usize, sid: ShardId, offset: u64, buf: []u8) anyerror!usize {
+        const self: *HttpTransport = @ptrCast(@alignCast(ctx));
+        if (self.isSelf(node)) return disk.getShardRange(self.data_dir, sid.bucket, sid.key, sid.index, offset, buf);
+        var pb: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "/_simpaniz/shards/{s}/{s}/{d}?offset={d}&len={d}", .{ sid.bucket, sid.key, sid.index, offset, buf.len });
+        const peer = try self.peerOf(node);
+        const r = self.doRequest(peer, "GET", path, "", true) catch |e| {
+            if (self.metrics) |m| _ = m.shard_get_err.fetchAdd(1, .monotonic);
+            return e;
+        };
+        switch (r) {
+            .not_found => return error.ShardMissing,
+            .ok => |bytes| {
+                defer self.allocator.free(bytes);
+                if (self.metrics) |m| _ = m.shard_get_ok.fetchAdd(1, .monotonic);
+                if (bytes.len > buf.len) return error.RangeTooLarge;
+                @memcpy(buf[0..bytes.len], bytes);
+                return bytes.len;
+            },
+        }
+    }
+
+    fn statShardVT(ctx: *anyopaque, node: usize, sid: ShardId) anyerror!u64 {
+        const self: *HttpTransport = @ptrCast(@alignCast(ctx));
+        if (self.isSelf(node)) return disk.statShard(self.data_dir, sid.bucket, sid.key, sid.index);
+        var pb: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pb, "/_simpaniz/shards/{s}/{s}/{d}?stat=1", .{ sid.bucket, sid.key, sid.index });
+        const peer = try self.peerOf(node);
+        const r = self.doRequest(peer, "GET", path, "", true) catch |e| {
+            if (self.metrics) |m| _ = m.shard_get_err.fetchAdd(1, .monotonic);
+            return e;
+        };
+        switch (r) {
+            .not_found => return error.ShardMissing,
+            .ok => |bytes| {
+                defer self.allocator.free(bytes);
+                if (self.metrics) |m| _ = m.shard_get_ok.fetchAdd(1, .monotonic);
+                return std.fmt.parseInt(u64, bytes, 10) catch error.MalformedResponse;
+            },
+        }
     }
 
     fn putMetaVT(ctx: *anyopaque, node: usize, bucket: []const u8, key: []const u8, data: []const u8) anyerror!void {

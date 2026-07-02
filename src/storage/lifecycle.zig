@@ -20,6 +20,7 @@ const Dir = std.fs.Dir;
 const paths = @import("paths.zig");
 const types = @import("types.zig");
 const internal = @import("internal.zig");
+const index_mod = @import("../index.zig");
 
 pub const Rule = struct {
     id: []const u8 = "",
@@ -131,8 +132,10 @@ pub const SweepStats = struct {
 };
 
 /// Walk every bucket's lifecycle config and delete objects older than each
-/// rule's `expiration_days` whose key starts with `prefix`.
-pub fn sweep(data_dir: Dir, allocator: Allocator, now_ns: i128) !SweepStats {
+/// rule's `expiration_days` whose key starts with `prefix`. When `index_mgr`
+/// is set, each expired key is also removed from the persistent listing
+/// index (single-node only — callers pass null in cluster mode).
+pub fn sweep(data_dir: Dir, allocator: Allocator, now_ns: i128, index_mgr: ?*index_mod.Manager) !SweepStats {
     var stats: SweepStats = .{};
     var iter = data_dir.iterate();
     while (try iter.next()) |entry| {
@@ -147,7 +150,7 @@ pub fn sweep(data_dir: Dir, allocator: Allocator, now_ns: i128) !SweepStats {
         var cfg = parseXml(allocator, xml_body) catch continue;
         defer cfg.deinit(allocator);
 
-        try sweepBucket(bd, entry.name, allocator, &cfg, now_ns, &stats);
+        try sweepBucket(bd, entry.name, allocator, &cfg, now_ns, &stats, index_mgr);
     }
     return stats;
 }
@@ -159,6 +162,7 @@ fn sweepBucket(
     cfg: *const Config,
     now_ns: i128,
     stats: *SweepStats,
+    index_mgr: ?*index_mod.Manager,
 ) !void {
     var walker = try bd.walk(allocator);
     defer walker.deinit();
@@ -193,6 +197,7 @@ fn sweepBucket(
             defer allocator.free(meta_path);
             bd.deleteFile(entry.path) catch break;
             bd.deleteFile(meta_path) catch {};
+            if (index_mgr) |ix| ix.noteDelete(bucket_name, norm);
             std.log.info(
                 "lifecycle: expired bucket={s} key={s} rule={s} days={d}",
                 .{ bucket_name, norm, rule.id, rule.expiration_days },
@@ -252,7 +257,7 @@ test "sweep expires old object" {
 
     // Pretend "now" is 2 days in the future.
     const future = std.time.nanoTimestamp() + 2 * std.time.ns_per_day;
-    const stats = try sweep(tmp.dir, allocator, future);
+    const stats = try sweep(tmp.dir, allocator, future, null);
     try std.testing.expect(stats.expired >= 1);
 
     // File is gone.

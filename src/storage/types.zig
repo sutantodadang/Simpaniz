@@ -14,17 +14,25 @@ pub const Error = error{
 };
 
 pub const EncryptionInfo = struct {
-    /// Algorithm name; only "AES256" is supported (SSE-S3).
+    /// Algorithm name: "AES256" (SSE-S3), "aws:kms" (SSE-KMS, local keyring),
+    /// or "SSE-C" (customer-provided key).
     alg: []const u8,
     /// Chunk size used for chunked AEAD (plaintext bytes per chunk).
     chunk_size: u32,
     /// Plaintext size of the object in bytes (file on disk is larger).
     plaintext_size: u64,
-    /// Base64-encoded data-encryption key, AES-GCM-wrapped under the master
-    /// key (ciphertext || 16-byte tag, 48 bytes total before base64).
+    /// Base64-encoded data-encryption key, AES-GCM-wrapped under the wrap
+    /// key (master key or SSE-C customer key) (ciphertext || 16-byte tag, 48
+    /// bytes total before base64).
     wrapped_dek_b64: []const u8,
     /// Base64-encoded 12-byte nonce used to wrap the DEK.
     wrap_nonce_b64: []const u8,
+    /// SSE-C only: base64 MD5 of the customer-supplied key, used to verify
+    /// the same key is presented on GET/HEAD. Empty when absent.
+    sse_c_key_md5: []const u8 = "",
+    /// SSE-KMS only: the (local) key id echoed back to the caller. Empty
+    /// when absent.
+    kms_key_id: []const u8 = "",
 };
 
 pub const ObjectMeta = struct {
@@ -66,9 +74,19 @@ pub const PutInput = struct {
     expected_md5_b64: []const u8 = "",
     /// Optional caller-supplied x-amz-content-sha256 to verify against payload.
     expected_sha256_hex: []const u8 = "",
-    /// When non-null, encrypt at rest using SSE-S3 chunked AES-256-GCM.
+    /// When non-null, encrypt at rest using chunked AES-256-GCM. Doubles as
+    /// the "wrap key" (KEK) for the per-object DEK: the server master key
+    /// for SSE-S3/SSE-KMS, or the customer-supplied key for SSE-C.
     /// Pointer must remain valid for the duration of the call.
     master_key: ?*const [32]u8 = null,
+    /// Algorithm to record when `master_key` is set: "AES256", "aws:kms",
+    /// or "SSE-C".
+    sse_alg: []const u8 = "AES256",
+    /// SSE-C only: base64 MD5 of the customer key, stored so GET/HEAD can
+    /// verify the same key is presented.
+    sse_c_key_md5: []const u8 = "",
+    /// SSE-KMS only: key id to echo back to callers.
+    kms_key_id: []const u8 = "",
 };
 
 pub const PartCopyRange = struct { start: u64, end: u64 };

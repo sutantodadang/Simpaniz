@@ -55,6 +55,58 @@ pub fn getShard(data_dir: std.fs.Dir, bucket: []const u8, key: []const u8, idx: 
     return buf;
 }
 
+/// Append `payload` (one stripe's chunk) to shard file `<idx>.shard` at
+/// logical stripe index `seq`. Validates that the file's current length is
+/// exactly `seq * payload.len` before appending; a length of
+/// `(seq + 1) * payload.len` is treated as an already-applied retry
+/// (idempotent no-op). Any other length is `error.SeqMismatch`.
+pub fn appendShardChunk(data_dir: std.fs.Dir, bucket: []const u8, key: []const u8, idx: u8, seq: u64, payload: []const u8) !void {
+    var pb: [1024]u8 = undefined;
+    const p = try shardPath(&pb, bucket, key, idx);
+    if (std.fs.path.dirname(p)) |dir| try data_dir.makePath(dir);
+    var f = try data_dir.createFile(p, .{ .truncate = false, .read = true });
+    defer f.close();
+    const stat = try f.stat();
+    const expected_before = seq * payload.len;
+    if (stat.size == expected_before) {
+        try f.seekTo(expected_before);
+        try f.writeAll(payload);
+    } else if (stat.size == expected_before + payload.len) {
+        return; // idempotent replay
+    } else {
+        return error.SeqMismatch;
+    }
+}
+
+/// Read up to `buf.len` bytes starting at `offset` from shard file
+/// `<idx>.shard`. Returns the number of bytes actually read.
+/// `error.ShardMissing` if the file does not exist.
+pub fn getShardRange(data_dir: std.fs.Dir, bucket: []const u8, key: []const u8, idx: u8, offset: u64, buf: []u8) !usize {
+    var pb: [1024]u8 = undefined;
+    const p = try shardPath(&pb, bucket, key, idx);
+    var f = data_dir.openFile(p, .{}) catch |e| switch (e) {
+        error.FileNotFound => return error.ShardMissing,
+        else => return e,
+    };
+    defer f.close();
+    try f.seekTo(offset);
+    return try f.readAll(buf);
+}
+
+/// Total byte length of shard file `<idx>.shard`. `error.ShardMissing` if
+/// the file does not exist.
+pub fn statShard(data_dir: std.fs.Dir, bucket: []const u8, key: []const u8, idx: u8) !u64 {
+    var pb: [1024]u8 = undefined;
+    const p = try shardPath(&pb, bucket, key, idx);
+    var f = data_dir.openFile(p, .{}) catch |e| switch (e) {
+        error.FileNotFound => return error.ShardMissing,
+        else => return e,
+    };
+    defer f.close();
+    const stat = try f.stat();
+    return stat.size;
+}
+
 pub fn deleteShard(data_dir: std.fs.Dir, bucket: []const u8, key: []const u8, idx: u8) !void {
     var pb: [1024]u8 = undefined;
     const p = try shardPath(&pb, bucket, key, idx);
@@ -96,6 +148,29 @@ pub fn deleteMeta(data_dir: std.fs.Dir, bucket: []const u8, key: []const u8) !vo
         error.FileNotFound => {},
         else => return e,
     };
+}
+
+/// Find the shard index (if any) this node currently stores locally for
+/// (bucket, key). A node holds at most one shard file per key under
+/// rendezvous placement (each of the k+m shard indices maps to a distinct
+/// node). Used by the rebalance sweep to find what to migrate.
+pub fn localShardIndex(data_dir: std.fs.Dir, bucket: []const u8, key: []const u8) !?u8 {
+    var pb: [1024]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&pb, "{s}/{s}/{s}", .{ shards_root, bucket, key });
+    var dir = data_dir.openDir(dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".shard")) continue;
+        const idx_str = entry.name[0 .. entry.name.len - ".shard".len];
+        const idx = std.fmt.parseInt(u8, idx_str, 10) catch continue;
+        return idx;
+    }
+    return null;
 }
 
 /// Walk every (bucket, key) for which this node has at least one local
@@ -171,6 +246,14 @@ fn collectVisitor(ctx: *anyopaque, bucket: []const u8, key: []const u8) anyerror
     const v: *VisitorCtx = @ptrCast(@alignCast(ctx));
     const s = try std.fmt.allocPrint(v.allocator, "{s}/{s}", .{ bucket, key });
     try v.found.append(v.allocator, s);
+}
+
+test "localShardIndex finds the stored shard index" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectEqual(@as(?u8, null), try localShardIndex(tmp.dir, "b", "k"));
+    try putShard(tmp.dir, "b", "k", 5, "payload");
+    try std.testing.expectEqual(@as(?u8, 5), try localShardIndex(tmp.dir, "b", "k"));
 }
 
 test "forEachLocalKey lists keys with meta" {

@@ -16,7 +16,9 @@ Status legend:
 | `HeadBucket` (`HEAD /b`)     |   ✅   |                                                 |
 | `GetBucketLocation`          |   ✅   | Returns the configured `SIMPANIZ_REGION`.         |
 | `GetBucketCors` / `PutBucketCors` | ⚠️ | Stored as raw XML; `Origin`/preflight handled. |
-| `GetBucketPolicy` / `PutBucketPolicy` / `DeleteBucketPolicy` | ⚠️ | Stored as raw JSON; not enforced on requests. |
+| `GetBucketPolicy` / `PutBucketPolicy` / `DeleteBucketPolicy` | ✅ | Stored as raw JSON; **enforced** on every request (explicit Deny wins, then Allow, default-deny for authenticated non-root users). Root bypasses. |
+| `PutBucketNotificationConfiguration` / `GetBucketNotificationConfiguration` | ✅ | XML `<Event>` patterns (e.g. `s3:ObjectCreated:*`) + prefix/suffix `FilterRule`s. Requires `SIMPANIZ_NOTIFY_WEBHOOK` to actually deliver. |
+| `PutBucketEncryption` / `GetBucketEncryption` / `DeleteBucketEncryption` | ✅ | Default SSE (AES256 or aws:kms) applied to PUTs that don't override it. |
 | `GetBucketVersioning` / `PutBucketVersioning` | ⚠️ | `Enabled` / `Suspended` honoured. PUT snapshots the prior version under `.simpaniz-versions/`. `?versionId=` GET/HEAD/DELETE supported. `ListObjectVersions` (`GET ?versions`) returns versions and delete markers. Delete markers are written when versioning is enabled and `DELETE` arrives without `?versionId=`. `Suspended` semantics on overwrite still TODO. |
 | `GetBucketLifecycle` / `PutBucketLifecycle` / `DeleteBucketLifecycle` | ⚠️ | XML stored verbatim. Background sweeper expires objects matching `<Prefix>` older than `<Days>` when `SIMPANIZ_LIFECYCLE_INTERVAL_S` > 0. Transitions, `<NoncurrentVersionExpiration>`, and tag filters are not implemented. |
 
@@ -26,21 +28,22 @@ Status legend:
 | ------------------------------------------ | :----: | -------------------------------------------------------- |
 | `PutObject`                                |   ✅   | Streamed; `Content-MD5` & `x-amz-content-sha256` checked. |
 | `GetObject`                                |   ✅   | Zero-copy file streaming.                                 |
-| `GetObject` with `Range`                   |   ✅   | `bytes=start-end`, `bytes=start-`, and suffix ranges (`bytes=-N`). `206 Partial Content`. |
+| `GetObject` with `Range`                   |   ✅   | `bytes=start-end`, `bytes=start-`, and suffix ranges (`bytes=-N`). `206 Partial Content`. Works on SSE-encrypted objects (per-chunk IV addressing). |
 | `HeadObject`                               |   ✅   |                                                          |
 | `DeleteObject`                             |   ✅   | Removes data, metadata, and now-empty parent dirs.        |
 | `DeleteObjects` (`POST ?delete`)           |   ✅   |                                                          |
 | `CopyObject`                               |   ✅   | `x-amz-copy-source` (path-style only).                    |
 | Conditional `If-Match` / `If-None-Match`   |   ✅   | On `GET` and `HEAD`.                                      |
 | Conditional `If-Modified-Since` / `Unmodified-Since` | ✅ |                                                  |
-| `ListObjectsV2`                            |   ✅   | `prefix`, `delimiter`, `max-keys`, `continuation-token`, `start-after`, `CommonPrefixes`. |
+| `ListObjectsV2`                            |   ✅   | `prefix`, `delimiter`, `max-keys`, `continuation-token`, `start-after`, `CommonPrefixes`. Single-node listing served from a metadata index (`index.zig`) with flat memory; continuation-token pagination is loss-free (fixed a bug where the boundary key was dropped on truncated pages). |
 | `ListObjects` (v1)                         |   ⚠️  | Routes to the same handler; `marker` ≈ `start-after`.     |
 | Object tags (`PutObjectTagging` / `GetObjectTagging` / `DeleteObjectTagging`) | ✅ | Stored as XML next to object metadata. |
 | Object Lock / Legal Hold                   |   ⚠️  | Per-object retention (`PutObjectRetention`/`GetObjectRetention`) and legal hold (`PutObjectLegalHold`/`GetObjectLegalHold`) implemented. `DELETE`/overwrite returns `403 AccessDenied` while protected. `GOVERNANCE` may be bypassed with `x-amz-bypass-governance-retention: true`. Bucket-level default retention not yet stored. |
 | Bitrot scrubber                            |   ✅   | Background MD5 re-verification when `SIMPANIZ_SCRUB_INTERVAL_S` > 0. Surfaces failures via `simpaniz_bitrot_errors_total` and warn-level logs. |
 | Object ACLs                                |   ❌   | All-or-nothing access via SigV4.                          |
-| SSE-S3 (`x-amz-server-side-encryption: AES256`) | ⚠️ | AES-256-GCM, chunked (64 KiB), per-object DEK wrapped under `SIMPANIZ_MASTER_KEY`. Not yet supported on multipart, copy-source, default-bucket-encryption, or `Range` GET. |
-| SSE-KMS / SSE-C                            |   ❌   | Not implemented.                                          |
+| SSE-S3 (`x-amz-server-side-encryption: AES256`) | ✅ | AES-256-GCM, chunked (64 KiB), per-object DEK wrapped under `SIMPANIZ_MASTER_KEY`. Supported on single PUT/GET, multipart, copy-source, default-bucket-encryption, and `Range` GET. |
+| SSE-C (customer-provided key)              |   ✅   | Customer key supplied via request headers, MD5-validated, never persisted server-side. |
+| SSE-KMS (`aws:kms`)                        |   ✅   | Local keyring (master-key wrap under `SIMPANIZ_MASTER_KEY`), not an external/pluggable KMS. Response echoes alg `aws:kms` + key-id. |
 
 ## Multipart upload
 
@@ -53,6 +56,7 @@ Status legend:
 | `ListParts`                                |   ✅   |                                                          |
 | `ListMultipartUploads`                     |   ✅   | Bucket-level listing via `GET /b?uploads`.                |
 | `UploadPartCopy`                           |   ✅   | Triggered by `x-amz-copy-source` on `UploadPart`. Range supported. |
+| Multipart SSE                              |   ✅   | Parts staged plaintext, encrypted at `CompleteMultipartUpload`. |
 
 ## Authentication
 
@@ -62,7 +66,8 @@ Status legend:
 | AWS Signature V4 — presigned URL           |   ✅   |                                                          |
 | AWS Signature V2                           |   ❌   | Deprecated by AWS; not implemented.                       |
 | `STS:AssumeRole` etc.                      |   ❌   |                                                          |
-| Anonymous mode                             |   ✅   | When no credentials configured.                           |
+| Anonymous mode                             |   ✅   | When no credentials configured. Default-allow unless a bucket policy denies. |
+| Multi-user IAM + policy enforcement        |   ✅   | `<DATA_DIR>/.simpaniz-iam/users.json`. Bucket + inline user policies (Effect/Action/Resource/Principal/Condition) enforced after SigV4 verify. |
 
 ## Routing
 
@@ -87,8 +92,8 @@ The following clients have been used against Simpaniz:
 
 - ✅ `curl` — all CRUD ops, multipart, range, conditional GETs.
 - ⚠️ AWS CLI — works for object CRUD; multipart upload works with
-  `--multipart-chunksize ≥ 5MB`. Some bucket-level admin ops (e.g.
-  `s3api put-bucket-policy`) are not implemented and return 501.
+  `--multipart-chunksize ≥ 5MB`. `s3api put-bucket-policy` works and is
+  enforced. Some other bucket-level admin ops remain unimplemented (501).
 - ⚠️ `mc` (MinIO client) — basic ops work; admin commands are
   MinIO-proprietary and not supported.
 - ⚠️ `s3cmd` / `boto3` / `aws-sdk-go` — object ops work; advanced
@@ -105,13 +110,14 @@ The following clients have been used against Simpaniz:
 | Cluster config (`SIMPANIZ_NODE_ID`/`SIMPANIZ_PEERS`) | ✅ | Static peer list, EC params, shared cluster secret. |
 | HTTP shard transport (inter-node)          |   ✅   | Hand-rolled HTTP/1.1 over `std.net`. Self-node short-circuits to local disk. Auth via `X-Simpaniz-Cluster-Auth` shared secret. Configurable send/recv timeout via `SIMPANIZ_CLUSTER_TIMEOUT_MS` (default 5000). Per-RPC counters surface as `simpaniz_cluster_*` Prometheus metrics. |
 | Internal `/_simpaniz/{shards,meta,bucket}/...` endpoint | ✅ | Bypasses SigV4. Constant-time secret compare. |
-| Distributed PUT / GET / HEAD / DELETE      |   ✅   | Cluster PUT streams directly into the encode buffer (no double-buffer). Cluster GET supports `Range`, `If-Match`, `If-None-Match`. Cluster CopyObject (`x-amz-copy-source`) reads source via the EC ring and re-puts into the destination. |
+| Distributed PUT / GET / HEAD / DELETE      |   ✅   | Stripe-streamed (default 1 MiB chunk/shard/stripe): PUT/GET/heal memory stays ~one stripe regardless of object size, no full-object EC buffers. Cluster GET supports `Range` (streams only overlapping stripes), `If-Match`, `If-None-Match`. Cluster CopyObject (`x-amz-copy-source`) reads source via the EC ring and re-puts into the destination. Back-compatible with the old single-stripe shard layout. |
 | Multipart upload in cluster mode           |   ✅   | `CreateMultipartUpload`/`UploadPart` stay local; `CompleteMultipartUpload` assembles locally, promotes the object into the EC ring, then drops the local copy. ETag retains MinIO/S3 `<md5>-<N>` format on the API response. |
 | Self-healing background daemon             |   ✅   | `SIMPANIZ_HEAL_INTERVAL_S` (default 0). Walks local meta files, repairs missing shards via the orchestrator. Counter `simpaniz_heal_repaired_total`. |
 | Bucket replication on `CreateBucket`/`DeleteBucket` | ✅ | Auto fans out to every peer over the internal endpoint. Tolerates up to `m` peer failures (matches shard write quorum). Idempotent. |
 | Server-side replication (cross-cluster)    |   ⚠️  | Best-effort async replicator: enqueue on PUT, deliver via background worker over HTTP **or HTTPS** (scheme picked from target URL via `std.http.Client.fetch`). Configure with `SIMPANIZ_REPL_TARGETS="src=>http://peer:9000/dst,..."` or `https://...`. Optional `SIMPANIZ_REPL_AUTH` is sent verbatim as `Authorization`. Persistent on-disk journal at `<data_dir>/.simpaniz-repl/queue.log` survives restarts. Metrics: `simpaniz_repl_{queued,replicated,failed}_total` + `simpaniz_repl_pending`. |
-| `/cluster/health` endpoint                 |   ✅   | JSON status: own node id and peer list. No active probing yet. |
-| Membership (gossip / Raft)                 |   ❌   | Static peer list only — deferred. Quorum is implicit via `k+m` placement; tolerates up to `m` failed peers per write. |
+| `/cluster/health` endpoint                 |   ✅   | JSON status: own node id, peer list, and per-node membership state (alive/suspect/down). |
+| Membership (gossip / Raft)                 |   ⚠️  | SWIM-lite: active health probing (`SIMPANIZ_PROBE_INTERVAL_MS`/`SIMPANIZ_PROBE_FAILS`), alive/suspect/down states, node-list gossip piggybacked on `/_simpaniz/ping`, dynamic join (`SIMPANIZ_JOIN=1`). No Raft, no decommission. Quorum is implicit via `k+m` placement; tolerates up to `m` failed peers per write. |
+| Shard rebalance                            |   ✅   | `SIMPANIZ_REBALANCE_INTERVAL_S` (default 300) + membership-change-triggered sweeps migrate shards to new HRW owners (copy+verify+delete). May leave orphaned local meta after migration. |
 
 ### Cluster mode quickstart
 

@@ -169,6 +169,60 @@ pub fn decryptStream(
     }
 }
 
+/// Decrypt a plaintext window `[offset, offset+len)` from an encrypted
+/// object. `reader` must be positioned at the start of the encrypted file
+/// (header). Skips whole chunks before the window via `discardAll64`, then
+/// decrypts chunk-by-chunk, trimming the first/last chunk to the window.
+pub fn decryptRange(
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    dek: *const [dek_size]u8,
+    plaintext_total: u64,
+    offset: u64,
+    len: u64,
+) !void {
+    const chunk_size = try readHeader(reader);
+    if (chunk_size == 0 or chunk_size > 16 * 1024 * 1024) return error.BadHeader;
+    if (len == 0) return;
+
+    const chunk_stride: u64 = @as(u64, nonce_size) + @as(u64, chunk_size) + @as(u64, tag_size);
+    const first_chunk = offset / chunk_size;
+    const skip_bytes = first_chunk * chunk_stride;
+    if (skip_bytes > 0) try reader.discardAll64(skip_bytes);
+
+    var ct_buf = try std.heap.page_allocator.alloc(u8, chunk_size);
+    defer std.heap.page_allocator.free(ct_buf);
+    var pt_buf = try std.heap.page_allocator.alloc(u8, chunk_size);
+    defer std.heap.page_allocator.free(pt_buf);
+
+    var index: u64 = first_chunk;
+    var skip_in_first: u64 = offset % chunk_size;
+    var remaining_out: u64 = len;
+    var chunk_start: u64 = index * chunk_size;
+
+    while (remaining_out > 0) {
+        if (chunk_start >= plaintext_total) return error.Truncated;
+        const chunk_pt_size: usize = @intCast(@min(@as(u64, chunk_size), plaintext_total - chunk_start));
+        var nonce: [nonce_size]u8 = undefined;
+        try reader.readSliceAll(&nonce);
+        try reader.readSliceAll(ct_buf[0..chunk_pt_size]);
+        var tag: [tag_size]u8 = undefined;
+        try reader.readSliceAll(&tag);
+        const aad = aadForChunk(index);
+        Aes256Gcm.decrypt(pt_buf[0..chunk_pt_size], ct_buf[0..chunk_pt_size], tag, &aad, nonce, dek.*) catch return error.DecryptFailed;
+
+        const start_in_chunk: usize = @intCast(skip_in_first);
+        const avail: usize = chunk_pt_size - start_in_chunk;
+        const emit: usize = @intCast(@min(@as(u64, avail), remaining_out));
+        try writer.writeAll(pt_buf[start_in_chunk .. start_in_chunk + emit]);
+        remaining_out -= emit;
+
+        skip_in_first = 0;
+        index += 1;
+        chunk_start += chunk_size;
+    }
+}
+
 test "roundtrip wrap/unwrap dek" {
     var master: [32]u8 = undefined;
     std.crypto.random.bytes(&master);
@@ -218,4 +272,41 @@ test "tampered chunk fails auth" {
     var dec_writer = Io.Writer.Allocating.init(std.testing.allocator);
     defer dec_writer.deinit();
     try std.testing.expectError(error.DecryptFailed, decryptStream(&dec_reader, &dec_writer.writer, plaintext.len, &dek));
+}
+
+test "decryptRange windows match plaintext slices" {
+    const a = std.testing.allocator;
+    // 200KB of pseudo-random-ish content so byte-for-byte comparisons are meaningful.
+    const plaintext = try a.alloc(u8, 200 * 1024);
+    defer a.free(plaintext);
+    for (plaintext, 0..) |*b, i| b.* = @truncate(i *% 2654435761 +% 17);
+
+    var dek: [dek_size]u8 = undefined;
+    std.crypto.random.bytes(&dek);
+
+    const chunk_size: u32 = 16 * 1024; // several chunks across 200KB
+    var pt_reader = Io.Reader.fixed(plaintext);
+    var enc_writer = Io.Writer.Allocating.init(a);
+    defer enc_writer.deinit();
+    _ = try encryptStream(&pt_reader, &enc_writer.writer, plaintext.len, &dek, chunk_size);
+    const ciphertext = enc_writer.written();
+
+    const Window = struct { offset: u64, len: u64 };
+    const windows = [_]Window{
+        .{ .offset = 0, .len = 100 }, // intra first chunk
+        .{ .offset = chunk_size - 50, .len = 200 }, // crosses chunk boundary
+        .{ .offset = 5 * chunk_size + 10, .len = 3 * chunk_size }, // spans multiple chunks
+        .{ .offset = plaintext.len - 500, .len = 500 }, // suffix
+        .{ .offset = 0, .len = plaintext.len }, // full
+    };
+
+    for (windows) |w| {
+        var dec_reader = Io.Reader.fixed(ciphertext);
+        var dec_writer = Io.Writer.Allocating.init(a);
+        defer dec_writer.deinit();
+        try decryptRange(&dec_reader, &dec_writer.writer, &dek, plaintext.len, w.offset, w.len);
+        const got = dec_writer.written();
+        const want = plaintext[@intCast(w.offset)..@intCast(w.offset + w.len)];
+        try std.testing.expectEqualSlices(u8, want, got);
+    }
 }

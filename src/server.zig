@@ -15,12 +15,19 @@ const metrics = @import("metrics.zig");
 const storage = @import("storage.zig");
 const cluster = @import("cluster.zig");
 const ui = @import("ui.zig");
+const iam = @import("iam.zig");
+const events = @import("events.zig");
+const tls_server = @import("tls_server.zig");
+const index_mod = @import("index.zig");
 
 const DaemonCtx = struct {
     data_dir: std.fs.Dir,
     gpa: Allocator,
     registry: *metrics.Registry,
     interval_ns: u64,
+    /// Only set for the lifecycle sweeper — background expirations must also
+    /// remove the expired key from the persistent listing index.
+    index: ?*index_mod.Manager = null,
 };
 
 const HealDaemonCtx = struct {
@@ -45,6 +52,41 @@ fn healLoop(c: *HealDaemonCtx) void {
     }
 }
 
+const RebalanceDaemonCtx = struct {
+    rt: *cluster.ClusterRuntime,
+    gpa: Allocator,
+    /// Poll tick for noticing a membership generation change; the actual
+    /// sweep only runs when `interval_s` has elapsed OR the generation
+    /// moved since the last sweep, whichever comes first.
+    poll_interval_ns: u64 = 5 * std.time.ns_per_s,
+    interval_ns: u64,
+    last_generation: u64 = 0,
+    last_sweep_ns: i128 = 0,
+};
+
+fn rebalanceLoop(c: *RebalanceDaemonCtx) void {
+    while (!shutdown_requested.load(.seq_cst)) {
+        std.Thread.sleep(c.poll_interval_ns);
+        if (shutdown_requested.load(.seq_cst)) break;
+
+        const gen = c.rt.membership.generation.load(.monotonic);
+        const now_ns = std.time.nanoTimestamp();
+        const due_by_interval = c.interval_ns > 0 and (now_ns - c.last_sweep_ns) >= @as(i128, @intCast(c.interval_ns));
+        const due_by_membership_change = gen != c.last_generation;
+        if (!due_by_interval and !due_by_membership_change) continue;
+
+        c.last_generation = gen;
+        c.last_sweep_ns = now_ns;
+        const stats = cluster.RebalanceDaemon.runOnce(c.rt, c.gpa) catch |e| {
+            std.log.warn("rebalance run failed: {}", .{e});
+            continue;
+        };
+        if (stats.moved > 0 or stats.errors > 0) {
+            std.log.info("rebalance: scanned={d} moved={d} errors={d}", .{ stats.scanned, stats.moved, stats.errors });
+        }
+    }
+}
+
 fn scrubLoop(c: *DaemonCtx) void {
     while (!shutdown_requested.load(.seq_cst)) {
         std.Thread.sleep(c.interval_ns);
@@ -64,7 +106,7 @@ fn lifecycleLoop(c: *DaemonCtx) void {
         std.Thread.sleep(c.interval_ns);
         if (shutdown_requested.load(.seq_cst)) break;
         const now: i128 = std.time.nanoTimestamp();
-        const stats = storage.sweepLifecycle(c.data_dir, c.gpa, now) catch |e| {
+        const stats = storage.sweepLifecycle(c.data_dir, c.gpa, now, c.index) catch |e| {
             std.log.warn("lifecycle sweep failed: {}", .{e});
             continue;
         };
@@ -122,6 +164,12 @@ pub const Context = struct {
     gpa: Allocator,
     registry: *metrics.Registry,
     cluster: ?*cluster.ClusterRuntime = null,
+    iam: *iam.Store,
+    notifier: ?*events.Notifier = null,
+    tls: ?*tls_server.ServerContext = null,
+    /// Persistent object-listing index, single-node only (null in cluster
+    /// mode — cluster listing still walks the shard-local metadata).
+    index: ?*index_mod.Manager = null,
 };
 
 pub fn requestShutdown() void {
@@ -180,7 +228,7 @@ pub fn start(ctx: Context) !void {
     }
     if (ctx.config.lifecycle_interval_s > 0) {
         if (ctx.gpa.create(DaemonCtx)) |dc| {
-            dc.* = .{ .data_dir = ctx.data_dir, .gpa = ctx.gpa, .registry = ctx.registry, .interval_ns = ctx.config.lifecycle_interval_s * std.time.ns_per_s };
+            dc.* = .{ .data_dir = ctx.data_dir, .gpa = ctx.gpa, .registry = ctx.registry, .interval_ns = ctx.config.lifecycle_interval_s * std.time.ns_per_s, .index = ctx.index };
             if (std.Thread.spawn(.{}, lifecycleLoop, .{dc})) |t| {
                 t.detach();
                 std.log.info("lifecycle daemon enabled (interval={d}s)", .{ctx.config.lifecycle_interval_s});
@@ -207,6 +255,36 @@ pub fn start(ctx: Context) !void {
             }
         } else |e| std.log.warn("heal daemon alloc failed: {}", .{e});
     }
+    if (ctx.cluster) |cr| {
+        // Membership prober: always on in cluster mode — this is the
+        // active health check that flips a killed node to `down` within
+        // the probe interval, and the gossip piggyback that lets nodes
+        // discover peers they didn't statically configure.
+        cr.startMembership() catch |e| std.log.warn("membership prober start failed: {}", .{e});
+        cr.joinCluster();
+
+        // Rebalance sweep runs unconditionally too: it self-throttles on
+        // `SIMPANIZ_REBALANCE_INTERVAL_S` for periodic sweeps but always
+        // reacts to a membership generation change (node joined/went
+        // down/came back), which is what makes "add a 4th node" actually
+        // redistribute shards without a restart.
+        if (ctx.gpa.create(RebalanceDaemonCtx)) |dc| {
+            dc.* = .{
+                .rt = cr,
+                .gpa = ctx.gpa,
+                .interval_ns = cr.config.rebalance_interval_s * std.time.ns_per_s,
+                .last_generation = cr.membership.generation.load(.monotonic),
+                .last_sweep_ns = std.time.nanoTimestamp(),
+            };
+            if (std.Thread.spawn(.{}, rebalanceLoop, .{dc})) |t| {
+                t.detach();
+                std.log.info("rebalance daemon enabled (interval={d}s)", .{cr.config.rebalance_interval_s});
+            } else |e| {
+                std.log.warn("rebalance daemon spawn failed: {}", .{e});
+                ctx.gpa.destroy(dc);
+            }
+        } else |e| std.log.warn("rebalance daemon alloc failed: {}", .{e});
+    }
 
     while (!shutdown_requested.load(.seq_cst)) {
         permits.acquire();
@@ -232,23 +310,59 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
     defer permits.release();
     defer stream.close();
 
+    if (ctx.tls) |tsrv| {
+        handleTlsConnection(stream, ctx, tsrv);
+        return;
+    }
+
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [64 * 1024]u8 = undefined;
     var sr = stream.reader(&read_buf);
     var sw = stream.writer(&write_buf);
 
+    serveHttp(sr.interface(), &sw.interface, ctx);
+}
+
+/// TLS-terminated connection path: performs the server-side TLS 1.3
+/// handshake, then runs the same HTTP request loop as the plaintext path
+/// over the decrypted `Io.Reader`/`Io.Writer` the handshake exposes.
+fn handleTlsConnection(stream: std.net.Stream, ctx: Context, tsrv: *tls_server.ServerContext) void {
+    var net_read_buf: [tls_server.Connection.min_net_buffer_len]u8 = undefined;
+    var net_write_buf: [tls_server.Connection.min_net_buffer_len]u8 = undefined;
+    var plain_read_buf: [tls_server.Connection.min_plain_read_buffer_len]u8 = undefined;
+    var plain_write_buf: [64 * 1024]u8 = undefined;
+
+    var conn = tls_server.Connection.accept(
+        stream,
+        tsrv,
+        &net_read_buf,
+        &net_write_buf,
+        &plain_read_buf,
+        &plain_write_buf,
+    ) catch |err| {
+        std.log.debug("tls handshake failed: {}", .{err});
+        return;
+    };
+    defer conn.close();
+
+    serveHttp(&conn.reader, &conn.writer, ctx);
+}
+
+/// Shared HTTP request-serving loop, driven over either a plaintext or a
+/// TLS-decrypted `Io.Reader`/`Io.Writer` pair.
+fn serveHttp(in: *Io.Reader, out: *Io.Writer, ctx: Context) void {
     while (!shutdown_requested.load(.seq_cst)) {
         const start_ns = std.time.nanoTimestamp();
         _ = ctx.registry.requests_in_flight.fetchAdd(1, .monotonic);
         defer _ = ctx.registry.requests_in_flight.fetchSub(1, .monotonic);
 
-        var request = http.parseRequest(sr.interface(), ctx.gpa, .{
+        var request = http.parseRequest(in, ctx.gpa, .{
             .max_header_bytes = ctx.config.max_header_bytes,
             .max_headers = ctx.config.max_headers,
         }) catch |err| {
             // Quietly close on EOF / closed-connection (common with curl one-shot).
             if (err == error.ReadFailed) return;
-            handleParseError(&sw.interface, err);
+            handleParseError(out, err);
             return;
         };
         defer request.deinit();
@@ -263,8 +377,8 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
         // Enforce body size limit (single-request).
         if (request.content_length > ctx.config.max_body_bytes) {
             ctx.registry.errors_total.inc();
-            http.writeError(&sw.interface, 413, "Payload Too Large", "");
-            sw.interface.flush() catch return;
+            http.writeError(out, 413, "Payload Too Large", "");
+            out.flush() catch return;
             return;
         }
 
@@ -273,7 +387,7 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
         // through normal auth.
         if (ui.matches(request.path)) {
             const resp = ui.serve(request.path);
-            writeAndLog(&sw.interface, &request, &resp, request_id, start_ns, ctx);
+            writeAndLog(out, &request, &resp, request_id, start_ns, ctx);
             drainBody(&request) catch return;
             continue;
         }
@@ -282,19 +396,43 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
         // secret in X-Simpaniz-Cluster-Auth header.
         if (ctx.cluster != null and cluster.isInternalPath(request.path)) {
             const cr = ctx.cluster.?;
-            const resp = cluster.internalHandler(&request, ctx.data_dir, cr.config.cluster_secret, ctx.config.max_body_bytes);
-            writeAndLog(&sw.interface, &request, &resp, request_id, start_ns, ctx);
+            const resp = cluster.internalHandler(&request, ctx.data_dir, cr.config.cluster_secret, ctx.config.max_body_bytes, cr.membership);
+            writeAndLog(out, &request, &resp, request_id, start_ns, ctx);
             drainBody(&request) catch return;
             continue;
         }
 
         // Auth (best-effort SigV4 verification when configured).
+        var principal: ?iam.Principal = null;
         if (ctx.config.auth_required) {
-            const ok = verifyRequestAuth(&request, ctx.config) catch false;
-            if (!ok) {
+            principal = verifyRequestAuth(&request, ctx.config, ctx.iam) catch null;
+            if (principal == null) {
                 ctx.registry.auth_failures.inc();
-                writeAuthError(&sw.interface, request_id);
-                sw.interface.flush() catch return;
+                writeAuthError(out, request_id);
+                out.flush() catch return;
+                drainBody(&request) catch {};
+                continue;
+            }
+        }
+
+        // Policy enforcement (skip root; skip metrics/health/console/cluster
+        // paths, which are either bypassed above or exempt below). Runs even
+        // when auth is not required so anonymous mode still honors an
+        // explicit bucket-policy Deny.
+        if (!isExemptPath(request.path)) {
+            var b: []const u8 = "";
+            var k: []const u8 = "";
+            router.splitBucketKey(&request, &b, &k);
+            const action = iam.mapAction(request.method, b, k, request.query);
+            const pol = if (b.len > 0)
+                storage.getBucketPolicy(ctx.data_dir, request.arena.allocator(), b) catch null
+            else
+                null;
+            const allowed = iam.authorize(ctx.iam, pol, principal, action, b, k, request.arena.allocator());
+            if (!allowed) {
+                ctx.registry.auth_failures.inc();
+                writeAccessDenied(out, request_id);
+                out.flush() catch return;
                 drainBody(&request) catch {};
                 continue;
             }
@@ -308,6 +446,8 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
             .master_key = if (ctx.config.master_key_set) &ctx.config.master_key else null,
             .cluster = ctx.cluster,
             .max_body_bytes = ctx.config.max_body_bytes,
+            .notifier = ctx.notifier,
+            .index = ctx.index,
         };
 
         // Special: /metrics (needs registry).
@@ -328,8 +468,8 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
                 ctx.registry.cluster_bucket_op_err.set(cr.metrics.bucket_op_err.load(.monotonic));
             }
             const body = ctx.registry.render(request.arena.allocator()) catch {
-                http.writeError(&sw.interface, 500, "Internal Server Error", "");
-                sw.interface.flush() catch return;
+                http.writeError(out, 500, "Internal Server Error", "");
+                out.flush() catch return;
                 continue;
             };
             const resp: http.Response = .{
@@ -338,7 +478,7 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
                 .content_type = "text/plain; version=0.0.4",
                 .body = .{ .bytes = body },
             };
-            writeAndLog(&sw.interface, &request, &resp, request_id, start_ns, ctx);
+            writeAndLog(out, &request, &resp, request_id, start_ns, ctx);
             continue;
         }
 
@@ -352,7 +492,7 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
             response.extra_headers = combined;
         } else |_| {}
 
-        writeAndLog(&sw.interface, &request, &response, request_id, start_ns, ctx);
+        writeAndLog(out, &request, &response, request_id, start_ns, ctx);
 
         // Close any owned file in the response body.
         switch (response.body) {
@@ -417,6 +557,28 @@ fn writeAuthError(w: *Io.Writer, request_id: []const u8) void {
     http.writeError(w, 403, "Forbidden", body);
 }
 
+/// Paths that bypass IAM policy enforcement: health/metrics probes and the
+/// cluster internal endpoint's public health mirror. These are either
+/// already handled earlier in `handleConnection` (cluster internal, web
+/// console) or need to stay reachable for orchestration tooling regardless
+/// of policy state.
+fn isExemptPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/healthz") or
+        std.mem.eql(u8, path, "/health") or
+        std.mem.eql(u8, path, "/readyz") or
+        std.mem.eql(u8, path, "/metrics") or
+        std.mem.eql(u8, path, "/cluster/health") or
+        std.mem.eql(u8, path, "/_simpaniz/cluster/health");
+}
+
+fn writeAccessDenied(w: *Io.Writer, request_id: []const u8) void {
+    const xml = @import("xml.zig");
+    var fba_buf: [2048]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const body = xml.buildError(fba.allocator(), "AccessDenied", "Access Denied.", "/", request_id) catch "";
+    http.writeError(w, 403, "Forbidden", body);
+}
+
 fn drainBody(req: *http.Request) !void {
     const remaining = req.content_length - req.body_consumed;
     if (remaining == 0) return;
@@ -430,11 +592,11 @@ fn drainBody(req: *http.Request) !void {
     }
 }
 
-fn verifyRequestAuth(req: *const http.Request, config: *const Config) !bool {
-    const auth_hdr = req.header("authorization") orelse return false;
-    if (!std.mem.startsWith(u8, auth_hdr, "AWS4-HMAC-SHA256 ")) return false;
+fn verifyRequestAuth(req: *const http.Request, config: *const Config, iam_store: *const iam.Store) !?iam.Principal {
+    const auth_hdr = req.header("authorization") orelse return null;
+    if (!std.mem.startsWith(u8, auth_hdr, "AWS4-HMAC-SHA256 ")) return null;
 
-    const date = req.header("x-amz-date") orelse return false;
+    const date = req.header("x-amz-date") orelse return null;
     const sha = req.header("x-amz-content-sha256") orelse "UNSIGNED-PAYLOAD";
     const host = req.header("host") orelse "";
 
@@ -442,26 +604,36 @@ fn verifyRequestAuth(req: *const http.Request, config: *const Config) !bool {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const parsed = auth.parseAuthorization(auth_hdr) catch return false;
+    const parsed = auth.parseAuthorization(auth_hdr) catch return null;
+
+    // Resolve which credentials to verify against: root config keys, or a
+    // matching IAM user's keys. Unknown access keys fail closed.
+    var creds: auth.Credentials = undefined;
+    var principal: iam.Principal = undefined;
+    if (std.mem.eql(u8, parsed.access_key, config.access_key)) {
+        creds = .{ .access_key = config.access_key, .secret_key = config.secret_key, .region = config.region };
+        principal = .{ .access_key = config.access_key, .is_root = true };
+    } else if (iam_store.findUser(parsed.access_key)) |user| {
+        creds = .{ .access_key = user.access_key, .secret_key = user.secret_key, .region = config.region };
+        principal = .{ .access_key = user.access_key, .is_root = false };
+    } else {
+        return null;
+    }
 
     var hdr_list = std.ArrayList(auth.Header){};
     var iter = std.mem.splitScalar(u8, parsed.signed_headers, ';');
     while (iter.next()) |name| {
         if (std.mem.eql(u8, name, "host")) {
-            hdr_list.append(a, .{ .name = "host", .value = host }) catch return false;
+            hdr_list.append(a, .{ .name = "host", .value = host }) catch return null;
             continue;
         }
-        const value = req.header(name) orelse return false;
-        hdr_list.append(a, .{ .name = name, .value = value }) catch return false;
+        const value = req.header(name) orelse return null;
+        hdr_list.append(a, .{ .name = name, .value = value }) catch return null;
     }
 
-    const canonical_query = canonicalizeQuery(a, req.query) catch return false;
+    const canonical_query = canonicalizeQuery(a, req.query) catch return null;
 
-    auth.verifyHeaderSignedRequest(a, .{
-        .access_key = config.access_key,
-        .secret_key = config.secret_key,
-        .region = config.region,
-    }, .{
+    auth.verifyHeaderSignedRequest(a, creds, .{
         .method = req.method.name(),
         .canonical_uri = req.raw_path,
         .canonical_query = canonical_query,
@@ -469,8 +641,8 @@ fn verifyRequestAuth(req: *const http.Request, config: *const Config) !bool {
         .payload_hash = sha,
         .authorization = auth_hdr,
         .amz_date = date,
-    }) catch return false;
-    return true;
+    }) catch return null;
+    return principal;
 }
 
 fn canonicalizeQuery(allocator: Allocator, raw: []const u8) ![]u8 {

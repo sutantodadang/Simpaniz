@@ -10,12 +10,20 @@ const xml = @import("../xml.zig");
 const paths = @import("paths.zig");
 const types = @import("types.zig");
 const internal = @import("internal.zig");
+const sse = @import("sse.zig");
+const buckets = @import("buckets.zig");
 
 const Error = types.Error;
 const ObjectMeta = types.ObjectMeta;
 const PartCopyRange = types.PartCopyRange;
+const EncryptionInfo = types.EncryptionInfo;
 
-pub fn createUpload(data_dir: Dir, allocator: Allocator, bucket: []const u8, key: []const u8, content_type: []const u8) Error![]const u8 {
+/// `sse_alg`: "" for no encryption, else "AES256" or "aws:kms" — recorded in
+/// the upload's meta.json so `completeUpload` knows to encrypt the final
+/// object. Staged parts under `.simpaniz-mp/` remain plaintext; encryption
+/// happens once at complete (ponytail: server-internal staging dir, not
+/// worth encrypting twice).
+pub fn createUpload(data_dir: Dir, allocator: Allocator, bucket: []const u8, key: []const u8, content_type: []const u8, sse_alg: []const u8) Error![]const u8 {
     util.validateObjectKey(key) catch return error.InvalidKey;
     var bd = data_dir.openDir(bucket, .{}) catch return error.BucketNotFound;
     defer bd.close();
@@ -37,7 +45,7 @@ pub fn createUpload(data_dir: Dir, allocator: Allocator, bucket: []const u8, key
     const meta_path = std.fmt.allocPrint(allocator, "{s}/meta.json", .{upload_root}) catch return error.OutOfMemory;
     defer allocator.free(meta_path);
     const meta_json = std.fmt.allocPrint(allocator,
-        "{{\"key\":\"{s}\",\"content_type\":\"{s}\"}}", .{ key, content_type }) catch return error.OutOfMemory;
+        "{{\"key\":\"{s}\",\"content_type\":\"{s}\",\"sse\":\"{s}\"}}", .{ key, content_type, sse_alg }) catch return error.OutOfMemory;
     defer allocator.free(meta_json);
     bd.writeFile(.{ .sub_path = meta_path, .data = meta_json }) catch return error.Internal;
 
@@ -84,6 +92,7 @@ pub fn completeUpload(
     bucket: []const u8,
     upload_id: []const u8,
     part_numbers: []const u32,
+    master_key: ?*const [32]u8,
 ) Error!ObjectMeta {
     var bd = data_dir.openDir(bucket, .{}) catch return error.BucketNotFound;
     defer bd.close();
@@ -99,6 +108,16 @@ pub fn completeUpload(
     defer allocator.free(key_owned);
     const ct_owned = allocator.dupe(u8, ct) catch return error.OutOfMemory;
     defer allocator.free(ct_owned);
+
+    // "sse" field recorded by createUpload; map to a static literal (never
+    // freed, matching objects.zig's convention for EncryptionInfo.alg).
+    const sse_alg: ?[]const u8 = blk: {
+        const raw = internal.extractJson(meta_json, "sse") orelse break :blk null;
+        if (std.mem.eql(u8, raw, "AES256")) break :blk @as([]const u8, "AES256");
+        if (std.mem.eql(u8, raw, "aws:kms")) break :blk @as([]const u8, "aws:kms");
+        break :blk null;
+    };
+    if (sse_alg != null and master_key == null) return error.Internal;
 
     if (std.fs.path.dirname(key_owned)) |parent| bd.makePath(parent) catch {};
 
@@ -159,21 +178,89 @@ pub fn completeUpload(
     out_file.sync() catch {};
     out_file.close();
 
-    bd.rename(tmp_name, key_owned) catch {
-        bd.deleteFile(tmp_name) catch {};
-        return error.Internal;
-    };
-
     var final_md5: [16]u8 = undefined;
     Md5.hash(part_md5_concat.items, &final_md5, .{});
     const final_hex = util.hexEncodeMd5(final_md5);
     const etag_str = std.fmt.allocPrint(allocator, "{s}-{d}", .{ &final_hex, part_numbers.len }) catch return error.OutOfMemory;
+
+    // No SSE requested: rename the concatenated plaintext straight into place.
+    var enc_info: ?EncryptionInfo = null;
+    if (sse_alg) |alg| {
+        const mk = master_key.?; // checked above: sse_alg != null implies master_key != null
+
+        var rand2: [12]u8 = undefined;
+        std.crypto.random.bytes(&rand2);
+        var tmp_enc_buf: [64]u8 = undefined;
+        var hex_buf3: [24]u8 = undefined;
+        util.hexEncodeBuf(&rand2, &hex_buf3);
+        const tmp_enc_name = std.fmt.bufPrint(&tmp_enc_buf, "{s}/completeenc-{s}", .{ paths.tmp_dir, hex_buf3[0 .. rand2.len * 2] }) catch return error.Internal;
+
+        var plain_file = bd.openFile(tmp_name, .{}) catch {
+            bd.deleteFile(tmp_name) catch {};
+            return error.Internal;
+        };
+        var pbuf: [64 * 1024]u8 = undefined;
+        var pr = plain_file.reader(&pbuf);
+
+        var enc_file = bd.createFile(tmp_enc_name, .{ .truncate = true, .exclusive = true }) catch {
+            plain_file.close();
+            bd.deleteFile(tmp_name) catch {};
+            return error.Internal;
+        };
+        var ebuf: [64 * 1024]u8 = undefined;
+        var ew = enc_file.writer(&ebuf);
+
+        const dek = sse.generateDek();
+        const w = sse.wrapDek(mk, &dek);
+        _ = sse.encryptStream(&pr.interface, &ew.interface, total, &dek, sse.default_chunk_size) catch {
+            plain_file.close();
+            enc_file.close();
+            bd.deleteFile(tmp_name) catch {};
+            bd.deleteFile(tmp_enc_name) catch {};
+            return error.Internal;
+        };
+        ew.interface.flush() catch {
+            plain_file.close();
+            enc_file.close();
+            bd.deleteFile(tmp_name) catch {};
+            bd.deleteFile(tmp_enc_name) catch {};
+            return error.Internal;
+        };
+        enc_file.sync() catch {};
+        enc_file.close();
+        plain_file.close();
+        bd.deleteFile(tmp_name) catch {};
+
+        bd.rename(tmp_enc_name, key_owned) catch {
+            bd.deleteFile(tmp_enc_name) catch {};
+            return error.Internal;
+        };
+
+        const enc_b64 = std.base64.standard.Encoder;
+        const wrapped_b64 = allocator.alloc(u8, enc_b64.calcSize(w.wrapped.len)) catch return error.OutOfMemory;
+        _ = enc_b64.encode(wrapped_b64, &w.wrapped);
+        const nonce_b64 = allocator.alloc(u8, enc_b64.calcSize(w.nonce.len)) catch return error.OutOfMemory;
+        _ = enc_b64.encode(nonce_b64, &w.nonce);
+        enc_info = .{
+            .alg = alg,
+            .chunk_size = sse.default_chunk_size,
+            .plaintext_size = total,
+            .wrapped_dek_b64 = wrapped_b64,
+            .wrap_nonce_b64 = nonce_b64,
+        };
+    } else {
+        bd.rename(tmp_name, key_owned) catch {
+            bd.deleteFile(tmp_name) catch {};
+            return error.Internal;
+        };
+    }
 
     try internal.writeMetadata(bd, allocator, key_owned, .{
         .content_type = ct_owned,
         .etag = etag_str,
         .size = total,
         .mtime_ns = std.time.nanoTimestamp(),
+        .encryption = enc_info,
     });
 
     const upload_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ paths.mp_dir, upload_id }) catch return error.OutOfMemory;
@@ -184,8 +271,9 @@ pub fn completeUpload(
     return .{
         .content_type = allocator.dupe(u8, ct_owned) catch return error.OutOfMemory,
         .etag = etag_str,
-        .size = final_stat.size,
+        .size = total,
         .mtime_ns = final_stat.mtime,
+        .encryption = enc_info,
     };
 }
 
@@ -355,4 +443,85 @@ pub fn uploadPartCopy(
     const lm = util.formatIso8601(&lm_buf, std.time.nanoTimestamp());
     const lm_owned = allocator.dupe(u8, lm) catch return error.OutOfMemory;
     return .{ .etag = etag, .last_modified = lm_owned };
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+test "completeUpload with sse=AES256 encrypts final object" {
+    const a = std.testing.allocator;
+    const internal_mod = @import("internal.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try buckets.createBucket(tmp.dir, "buk");
+
+    var master: [32]u8 = undefined;
+    std.crypto.random.bytes(&master);
+
+    const upload_id = try createUpload(tmp.dir, a, "buk", "enc-obj", "text/plain", "AES256");
+    defer a.free(upload_id);
+
+    const part1 = "Hello, " ** 500; // >1 chunk worth once concatenated with part2
+    const part2 = "multipart SSE world!" ** 500;
+    var r1 = Io.Reader.fixed(part1);
+    var r2 = Io.Reader.fixed(part2);
+    const etag1 = try putPart(tmp.dir, a, "buk", upload_id, 1, part1.len, &r1);
+    defer a.free(etag1);
+    const etag2 = try putPart(tmp.dir, a, "buk", upload_id, 2, part2.len, &r2);
+    defer a.free(etag2);
+
+    var parts = [_]u32{ 1, 2 };
+    const meta = try completeUpload(tmp.dir, a, "buk", upload_id, &parts, &master);
+    defer a.free(meta.content_type);
+    defer a.free(meta.etag);
+
+    // etag stays "hex-2" (plaintext-part-md5 based), unaffected by encryption.
+    try std.testing.expect(std.mem.indexOfScalar(u8, meta.etag, '-') != null);
+    try std.testing.expect(std.mem.endsWith(u8, meta.etag, "-2"));
+    try std.testing.expect(meta.encryption != null);
+    const enc = meta.encryption.?;
+    defer a.free(enc.wrapped_dek_b64);
+    defer a.free(enc.wrap_nonce_b64);
+    try std.testing.expectEqualStrings("AES256", enc.alg);
+    try std.testing.expectEqual(@as(u64, part1.len + part2.len), enc.plaintext_size);
+
+    // Decrypting the final object reproduces the concatenated plaintext.
+    var bd = try tmp.dir.openDir("buk", .{});
+    defer bd.close();
+    var f = try bd.openFile("enc-obj", .{});
+    defer f.close();
+    var read_buf: [64 * 1024]u8 = undefined;
+    var fr = f.reader(&read_buf);
+
+    const wrapped_raw = try internal_mod.decodeBase64(a, enc.wrapped_dek_b64);
+    defer a.free(wrapped_raw);
+    const nonce_raw = try internal_mod.decodeBase64(a, enc.wrap_nonce_b64);
+    defer a.free(nonce_raw);
+    const dek = try sse.unwrapDek(&master, wrapped_raw[0..sse.wrapped_dek_len], nonce_raw[0..sse.nonce_size]);
+
+    var dec_writer = Io.Writer.Allocating.init(a);
+    defer dec_writer.deinit();
+    try sse.decryptStream(&fr.interface, &dec_writer.writer, enc.plaintext_size, &dek);
+    const want = part1 ++ part2;
+    try std.testing.expectEqualStrings(want, dec_writer.written());
+}
+
+test "completeUpload without sse leaves object plaintext" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try buckets.createBucket(tmp.dir, "buk");
+
+    const upload_id = try createUpload(tmp.dir, a, "buk", "plain-obj", "text/plain", "");
+    defer a.free(upload_id);
+
+    const part1 = "plain content";
+    var r1 = Io.Reader.fixed(part1);
+    const etag1 = try putPart(tmp.dir, a, "buk", upload_id, 1, part1.len, &r1);
+    defer a.free(etag1);
+
+    var parts = [_]u32{1};
+    const meta = try completeUpload(tmp.dir, a, "buk", upload_id, &parts, null);
+    defer a.free(meta.content_type);
+    defer a.free(meta.etag);
+    try std.testing.expect(meta.encryption == null);
 }

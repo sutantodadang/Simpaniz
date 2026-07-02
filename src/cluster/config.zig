@@ -10,6 +10,14 @@
 //!   SIMPANIZ_EC_M            parity shards (default 2)
 //!   SIMPANIZ_CLUSTER_SECRET  shared secret used in `X-Simpaniz-Cluster-Auth`
 //!                             header on internal shard transfers.
+//!   SIMPANIZ_PROBE_INTERVAL_MS  membership health-probe interval (default 2000)
+//!   SIMPANIZ_PROBE_FAILS        consecutive probe failures before a node is
+//!                                marked `down` (default 3)
+//!   SIMPANIZ_REBALANCE_INTERVAL_S  shard-rebalance sweep interval in seconds;
+//!                                   0 disables the daemon (default 300)
+//!   SIMPANIZ_JOIN               "1"/"true" — on boot, POST a join request to
+//!                                the configured peers to announce this node
+//!                                (default false)
 //!
 //! When `enabled == false`, the server runs as a standalone single node
 //! (current behaviour).
@@ -44,6 +52,16 @@ pub const ClusterConfig = struct {
     /// Empty disables SSR.
     repl_targets_raw: []const u8,
 
+    /// Membership health-probe interval, milliseconds.
+    probe_interval_ms: u32,
+    /// Consecutive probe failures before a node flips to `down`.
+    probe_fails_threshold: u32,
+    /// Shard-rebalance sweep interval, seconds. 0 disables the daemon.
+    rebalance_interval_s: u64,
+    /// Announce this node to configured peers on boot via the internal
+    /// join endpoint.
+    join: bool,
+
     pub fn deinit(self: *ClusterConfig) void {
         self.arena.deinit();
     }
@@ -72,6 +90,10 @@ pub fn load(parent_allocator: Allocator) !ClusterConfig {
     const secret = getEnv(a, "SIMPANIZ_CLUSTER_SECRET", "");
     const timeout = parseU32(getEnv(a, "SIMPANIZ_CLUSTER_TIMEOUT_MS", "5000"), 5000);
     const repl = getEnv(a, "SIMPANIZ_REPL_TARGETS", "");
+    const probe_interval_ms = parseU32(getEnv(a, "SIMPANIZ_PROBE_INTERVAL_MS", "2000"), 2000);
+    const probe_fails = parseU32(getEnv(a, "SIMPANIZ_PROBE_FAILS", "3"), 3);
+    const rebalance_interval_s = parseU64(getEnv(a, "SIMPANIZ_REBALANCE_INTERVAL_S", "300"), 300);
+    const join = parseBool(getEnv(a, "SIMPANIZ_JOIN", "false"));
 
     if (node_id.len == 0 or peers_raw.len == 0) {
         return .{
@@ -85,6 +107,10 @@ pub fn load(parent_allocator: Allocator) !ClusterConfig {
             .cluster_secret = secret,
             .connect_timeout_ms = timeout,
             .repl_targets_raw = repl,
+            .probe_interval_ms = probe_interval_ms,
+            .probe_fails_threshold = probe_fails,
+            .rebalance_interval_s = rebalance_interval_s,
+            .join = join,
         };
     }
 
@@ -127,11 +153,23 @@ pub fn load(parent_allocator: Allocator) !ClusterConfig {
         .cluster_secret = secret,
         .connect_timeout_ms = timeout,
         .repl_targets_raw = repl,
+        .probe_interval_ms = probe_interval_ms,
+        .probe_fails_threshold = probe_fails,
+        .rebalance_interval_s = rebalance_interval_s,
+        .join = join,
     };
 }
 
 fn parseU32(s: []const u8, default: u32) u32 {
     return std.fmt.parseInt(u32, s, 10) catch default;
+}
+
+fn parseU64(s: []const u8, default: u64) u64 {
+    return std.fmt.parseInt(u64, s, 10) catch default;
+}
+
+fn parseBool(s: []const u8) bool {
+    return std.mem.eql(u8, s, "1") or std.ascii.eqlIgnoreCase(s, "true");
 }
 
 fn parsePeers(a: Allocator, raw: []const u8) ![]const Peer {

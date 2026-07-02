@@ -32,6 +32,18 @@ pub const Transport = struct {
         putMeta: *const fn (ctx: *anyopaque, node: usize, bucket: []const u8, key: []const u8, data: []const u8) anyerror!void,
         getMeta: *const fn (ctx: *anyopaque, node: usize, bucket: []const u8, key: []const u8, allocator: Allocator) anyerror!?[]u8,
         deleteMeta: *const fn (ctx: *anyopaque, node: usize, bucket: []const u8, key: []const u8) anyerror!void,
+        /// Append one stripe's worth of bytes to shard `sid` at logical
+        /// position `seq` (0-based stripe index). Idempotent: replaying the
+        /// same `seq` with identical `data.len` after it already landed is a
+        /// no-op success. Any other length mismatch is `error.SeqMismatch`.
+        appendShardChunk: *const fn (ctx: *anyopaque, node: usize, sid: ShardId, seq: u64, data: []const u8) anyerror!void,
+        /// Read up to `buf.len` bytes starting at byte `offset` in shard
+        /// `sid`'s file. Returns the number of bytes actually read (may be
+        /// less than `buf.len` at EOF). Missing shard -> `error.ShardMissing`.
+        getShardRange: *const fn (ctx: *anyopaque, node: usize, sid: ShardId, offset: u64, buf: []u8) anyerror!usize,
+        /// Total byte length of shard `sid`'s file. Missing shard ->
+        /// `error.ShardMissing`.
+        statShard: *const fn (ctx: *anyopaque, node: usize, sid: ShardId) anyerror!u64,
     };
 
     pub inline fn putShard(self: Transport, node: usize, sid: ShardId, data: []const u8) !void {
@@ -42,6 +54,15 @@ pub const Transport = struct {
     }
     pub inline fn deleteShard(self: Transport, node: usize, sid: ShardId) !void {
         return self.vtable.deleteShard(self.ctx, node, sid);
+    }
+    pub inline fn appendShardChunk(self: Transport, node: usize, sid: ShardId, seq: u64, data: []const u8) !void {
+        return self.vtable.appendShardChunk(self.ctx, node, sid, seq, data);
+    }
+    pub inline fn getShardRange(self: Transport, node: usize, sid: ShardId, offset: u64, buf: []u8) !usize {
+        return self.vtable.getShardRange(self.ctx, node, sid, offset, buf);
+    }
+    pub inline fn statShard(self: Transport, node: usize, sid: ShardId) !u64 {
+        return self.vtable.statShard(self.ctx, node, sid);
     }
     pub inline fn putMeta(self: Transport, node: usize, bucket: []const u8, key: []const u8, data: []const u8) !void {
         return self.vtable.putMeta(self.ctx, node, bucket, key, data);
@@ -72,6 +93,9 @@ pub const LocalTransport = struct {
             .putMeta = putMeta,
             .getMeta = getMeta,
             .deleteMeta = delMeta,
+            .appendShardChunk = appendChunk,
+            .getShardRange = getRange,
+            .statShard = statShardFn,
         } };
     }
 
@@ -112,6 +136,61 @@ pub const LocalTransport = struct {
         const n = try f.readAll(buf);
         if (n != stat.size) return error.ShortRead;
         return buf;
+    }
+
+    /// Append `data` (one stripe's chunk) to shard `sid`'s file at logical
+    /// stripe index `seq`. If the file's current length equals
+    /// `seq * data.len`, append lands normally. If it already equals
+    /// `(seq + 1) * data.len`, the write was already applied (retry) and
+    /// this is a no-op. Anything else is `error.SeqMismatch`.
+    fn appendChunk(ctx: *anyopaque, node: usize, sid: ShardId, seq: u64, data: []const u8) anyerror!void {
+        const self: *LocalTransport = @ptrCast(@alignCast(ctx));
+        if (node >= self.node_count) return error.InvalidNode;
+        var pb: [512]u8 = undefined;
+        const p = try pathFor(&pb, node, sid);
+        if (std.fs.path.dirname(p)) |dir| try self.root.makePath(dir);
+        var f = try self.root.createFile(p, .{ .truncate = false, .read = true });
+        defer f.close();
+        const stat = try f.stat();
+        const expected_before = seq * data.len;
+        if (stat.size == expected_before) {
+            try f.seekTo(expected_before);
+            try f.writeAll(data);
+        } else if (stat.size == expected_before + data.len) {
+            return; // idempotent replay of an already-applied append
+        } else {
+            return error.SeqMismatch;
+        }
+    }
+
+    /// Read up to `buf.len` bytes starting at `offset` from shard `sid`'s
+    /// file. Returns the number of bytes actually read.
+    fn getRange(ctx: *anyopaque, node: usize, sid: ShardId, offset: u64, buf: []u8) anyerror!usize {
+        const self: *LocalTransport = @ptrCast(@alignCast(ctx));
+        if (node >= self.node_count) return error.InvalidNode;
+        var pb: [512]u8 = undefined;
+        const p = try pathFor(&pb, node, sid);
+        var f = self.root.openFile(p, .{}) catch |e| switch (e) {
+            error.FileNotFound => return error.ShardMissing,
+            else => return e,
+        };
+        defer f.close();
+        try f.seekTo(offset);
+        return try f.readAll(buf);
+    }
+
+    fn statShardFn(ctx: *anyopaque, node: usize, sid: ShardId) anyerror!u64 {
+        const self: *LocalTransport = @ptrCast(@alignCast(ctx));
+        if (node >= self.node_count) return error.InvalidNode;
+        var pb: [512]u8 = undefined;
+        const p = try pathFor(&pb, node, sid);
+        var f = self.root.openFile(p, .{}) catch |e| switch (e) {
+            error.FileNotFound => return error.ShardMissing,
+            else => return e,
+        };
+        defer f.close();
+        const stat = try f.stat();
+        return stat.size;
     }
 
     fn del(ctx: *anyopaque, node: usize, sid: ShardId) anyerror!void {
@@ -187,6 +266,31 @@ test "LocalTransport round-trips a shard" {
     try t.deleteShard(1, sid);
     const after = try t.getShard(1, sid, std.testing.allocator);
     try std.testing.expect(after == null);
+}
+
+test "LocalTransport appendShardChunk validates seq and reads back ranges" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var lt = LocalTransport.init(tmp.dir, 2);
+    const t = lt.transport();
+    const sid: ShardId = .{ .bucket = "buk", .key = "k1", .index = 0 };
+
+    try t.appendShardChunk(0, sid, 0, "AAAA");
+    // Wrong seq (skips ahead) must fail.
+    try std.testing.expectError(error.SeqMismatch, t.appendShardChunk(0, sid, 2, "CCCC"));
+    // Replay of the already-applied seq 0 chunk is a no-op success.
+    try t.appendShardChunk(0, sid, 0, "AAAA");
+    try t.appendShardChunk(0, sid, 1, "BBBB");
+
+    try std.testing.expectEqual(@as(u64, 8), try t.statShard(0, sid));
+
+    var buf: [4]u8 = undefined;
+    const n = try t.getShardRange(0, sid, 4, &buf);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("BBBB", buf[0..n]);
+
+    try std.testing.expectError(error.ShardMissing, t.statShard(1, sid));
 }
 
 test "LocalTransport round-trips meta" {

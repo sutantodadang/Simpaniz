@@ -1,8 +1,9 @@
 # Simpaniz — Architecture
 
 Simpaniz is a single-binary, S3-compatible object server written in Zig 0.15.x.
-It is intentionally small (~3K lines), file-system backed, and designed to be
-run behind a reverse proxy (nginx, Caddy, traefik) for TLS termination.
+It is intentionally small, file-system backed, and terminates its own TLS
+in-process (TLS 1.3); a reverse proxy (nginx, Caddy, traefik) is optional,
+useful for RSA certs, TLS 1.2 clients, or LB fan-out.
 
 ## Module layout
 
@@ -42,6 +43,24 @@ src/
                     Renders to /metrics in text exposition format.
   util.zig          URL/AWS encoding, key/bucket validation, ISO8601 time,
                     request id generation, hex encoding helpers.
+  iam.zig           Multi-user credential store (`<data_dir>/.simpaniz-iam/
+                    users.json`) + AWS-style policy evaluation engine
+                    (Effect/Action/Resource/Principal/Condition, explicit-
+                    deny-wins). Wired into the request path after SigV4
+                    verify, before handler dispatch.
+  tls_server.zig    In-process TLS 1.3 server (Zig std has client only).
+                    Reuses `std.crypto.tls` wire types. AES-128/256-GCM +
+                    ChaCha20-Poly1305, x25519 only, ECDSA P-256 certs,
+                    ALPN http/1.1. No client certs/resumption/0-RTT.
+  events.zig        S3 event notifications. Per-bucket config drives a
+                    background worker that POSTs S3-event-shaped JSON to a
+                    configured webhook (`SIMPANIZ_NOTIFY_WEBHOOK`) on object
+                    create/delete — best-effort, no retries.
+  index.zig         Per-bucket LSM-lite metadata index (WAL + sorted segment
+                    with sparse footer) under `<bucket>/.simpaniz-index/`.
+                    Serves `ListObjectsV2` with flat memory on huge buckets;
+                    falls back to FS-walk-and-sort with lazy bootstrap.
+                    Single-node only — cluster listing still FS-walk.
 ```
 
 ## Request lifecycle
@@ -58,7 +77,10 @@ src/
    set), the server requires SigV4 on every request. Header-form is
    verified by reconstructing the canonical request from the raw URI,
    sorted re-encoded query, signed headers, and the supplied
-   `x-amz-content-sha256` (or `UNSIGNED-PAYLOAD`).
+   `x-amz-content-sha256` (or `UNSIGNED-PAYLOAD`). Immediately after SigV4
+   verification, `iam.zig` maps the request to an S3 action and evaluates
+   bucket + user policy; a `Deny` (or missing `Allow` for a non-root
+   authenticated user) short-circuits with `403` before routing.
 5. **Routing** — `router.route` chooses handler by method + subresource.
 6. **Streaming I/O** — PUT object writes go through a `std.Io.Reader →
    tmp file` pipeline that updates MD5 + SHA256 incrementally; the final
@@ -83,12 +105,15 @@ DATA_DIR/
         000001
         000002
     .simpaniz-tmp/                in-flight uploads (auto-cleaned on failure)
+    .simpaniz-index/              metadata index: WAL + sorted segment (single-node listing)
     <key>                       object data
     <prefix>/<key>              nested keys reflect on-disk hierarchy
+  .simpaniz-peers.json           dynamically joined cluster peers (persisted across restarts)
 ```
 
-Reserved prefixes (`.simpaniz-meta`, `.simpaniz-mp`, `.simpaniz-tmp`) are
-filtered out of bucket listings and bucket-empty checks.
+Reserved prefixes (`.simpaniz-meta`, `.simpaniz-mp`, `.simpaniz-tmp`,
+`.simpaniz-index`) are filtered out of bucket listings and bucket-empty
+checks.
 
 ## Concurrency model
 
@@ -104,15 +129,17 @@ filtered out of bucket listings and bucket-empty checks.
 
 ## Where it still deviates from MinIO
 
-- No in-process TLS — terminate with a reverse proxy.
-- No multi-user IAM, policy enforcement, ACLs, or STS.
-- SSE-S3, Object Lock, Lifecycle, Versioning, and replication exist only for
-  selected flows; see `COMPATIBILITY.md` for the exact matrix.
-- Distributed erasure-coded mode exists, but uses static membership, has no
-  rebalance/gossip/Raft, and still buffers full EC objects during cluster
-  PUT/GET paths.
-- No event notifications.
-- Listings are walked in memory (no on-disk index).
+- No ACLs or STS (AssumeRole, OIDC, LDAP); IAM/policy enforcement and
+  in-process TLS are done (see `iam.zig`, `tls_server.zig`).
+- SSE-KMS uses a local keyring, not an external/pluggable KMS. Object Lock,
+  Lifecycle, and Versioning exist only for selected flows; see
+  `COMPATIBILITY.md` for the exact matrix.
+- Distributed erasure-coded mode has SWIM-lite membership + rebalance now
+  (`membership.zig`, `rebalance.zig`), and PUT/GET/heal are stripe-streamed
+  (no more full-object EC buffers). Still no Raft, no decommission.
+- Event notifications support webhook only (no Kafka/NATS/AMQP/MQTT).
+- Single-node listings are served from a per-bucket LSM-lite index
+  (`index.zig`); cluster-mode listings are still walked in memory.
 - Connection model is thread-per-conn, not evented.
 
 These are the items that turn an "S3-compatible server" into a
@@ -140,22 +167,39 @@ multi-node erasure-coded storage:
   "node" and is what drives unit tests. The HTTP transport reaches
   peers over internal `/_simpaniz/...` endpoints and short-circuits
   self-node traffic to local disk.
-- `orchestrator.zig` — End-to-end distributed object I/O. PUT
-  encodes `data → k+m shards` (last data shard zero-padded to
-  `shard_size = ceil(orig_size / k)`), maps each shard to a node
-  via rendezvous, and pushes via the transport. GET fetches any
-  `k` shards, RS-decodes, trims to `original_size`. `heal` detects
-  missing shards and re-pushes reconstructed copies.
+- `orchestrator.zig` — End-to-end distributed object I/O. Stripe-streamed:
+  encodes and ships one stripe (default 1 MiB chunk/shard/stripe) at a time,
+  so cluster PUT/GET/heal memory stays ~one stripe ((k+m)·chunk ≈ few MB)
+  regardless of object size, instead of buffering the full object. Maps each
+  shard to a node via rendezvous and pushes via the transport with
+  seq-validated idempotent chunk append. GET supports ranged shard reads —
+  `Range` GET on cluster objects streams only the overlapping stripes. `heal`
+  detects missing shards and re-pushes reconstructed copies. Back-compatible
+  with the old single-stripe shard layout.
 - `config.zig` — Boots cluster identity, peer list, EC params,
   and shared secret from environment variables. When
   `SIMPANIZ_NODE_ID` or `SIMPANIZ_PEERS` is empty the server falls
   back to standalone single-node behaviour.
+- `membership.zig` — SWIM-lite cluster membership: active health probing
+  (`SIMPANIZ_PROBE_INTERVAL_MS` default 2000, `SIMPANIZ_PROBE_FAILS` default
+  3) drives alive/suspect/down states from local probe results only; the
+  node list itself gossips piggybacked on `/_simpaniz/ping`. Dynamic node
+  join (`SIMPANIZ_JOIN=1` + `POST /_simpaniz/join`) persists newly joined
+  peers to `<data_dir>/.simpaniz-peers.json` so a restart doesn't forget
+  them. Down nodes are fast-skipped on reads. No decommission in v1.
+- `rebalance.zig` — Shard rebalance daemon (`SIMPANIZ_REBALANCE_INTERVAL_S`
+  default 300, plus membership-change-triggered sweeps). Walks locally
+  stored keys, recomputes HRW placement under the current node list, and
+  migrates any shard no longer owned locally to its new owner
+  (copy+verify+delete). May leave orphaned local meta after a migration.
 
 Remaining distributed-mode gaps:
 
-- Streaming EC encode/decode and response streaming instead of full-object
-  buffers in the cluster PUT/GET path.
-- Active health probing, topology changes, rebalance, and stronger membership.
-- Advanced feature parity in cluster mode, including version listings and the
-  full SSE/versioning/lifecycle/object-lock matrix.
-- Event notifications and stronger replication conflict/ordering semantics.
+- No Raft; membership state (alive/suspect/down) is locally observed per
+  node, not distributed-consensus voted. No node decommission.
+- Advanced feature parity in cluster mode, including version listings, the
+  full SSE/versioning/lifecycle/object-lock matrix, and the metadata index
+  layer (cluster listing still FS-walk).
+- Stronger replication conflict/ordering semantics. (Event notifications now
+  exist standalone via `events.zig`, not yet cluster-aware.)
+- Migrated shards from a rebalance sweep may leave orphaned local meta.

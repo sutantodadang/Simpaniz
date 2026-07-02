@@ -23,8 +23,9 @@ pub fn writeMetadata(bd: Dir, allocator: Allocator, key: []const u8, meta: Objec
             allocator,
             "{{\"content_type\":\"{s}\",\"etag\":\"{s}\",\"size\":{d},\"mtime_ns\":{d}," ++
                 "\"enc_alg\":\"{s}\",\"enc_chunk_size\":{d},\"enc_plaintext_size\":{d}," ++
-                "\"enc_wrapped_dek\":\"{s}\",\"enc_wrap_nonce\":\"{s}\"}}",
-            .{ meta.content_type, meta.etag, meta.size, meta.mtime_ns, enc.alg, enc.chunk_size, enc.plaintext_size, enc.wrapped_dek_b64, enc.wrap_nonce_b64 },
+                "\"enc_wrapped_dek\":\"{s}\",\"enc_wrap_nonce\":\"{s}\"," ++
+                "\"enc_sse_c_key_md5\":\"{s}\",\"enc_kms_key_id\":\"{s}\"}}",
+            .{ meta.content_type, meta.etag, meta.size, meta.mtime_ns, enc.alg, enc.chunk_size, enc.plaintext_size, enc.wrapped_dek_b64, enc.wrap_nonce_b64, enc.sse_c_key_md5, enc.kms_key_id },
         ) catch return error.OutOfMemory
     else
         std.fmt.allocPrint(
@@ -58,12 +59,18 @@ pub fn readMetadata(bd: Dir, allocator: Allocator, key: []const u8) !ObjectMeta 
         const pt_s = extractJson(json, "enc_plaintext_size") orelse "0";
         const wrapped = extractJson(json, "enc_wrapped_dek") orelse "";
         const nonce = extractJson(json, "enc_wrap_nonce") orelse "";
+        // sse_c_key_md5 / kms_key_id are absent from old sidecar JSON; default
+        // to empty strings so old encrypted objects still read cleanly.
+        const sse_c_md5 = extractJson(json, "enc_sse_c_key_md5") orelse "";
+        const kms_key_id = extractJson(json, "enc_kms_key_id") orelse "";
         encryption = .{
             .alg = try allocator.dupe(u8, alg),
             .chunk_size = std.fmt.parseInt(u32, chunk_s, 10) catch 0,
             .plaintext_size = std.fmt.parseInt(u64, pt_s, 10) catch 0,
             .wrapped_dek_b64 = try allocator.dupe(u8, wrapped),
             .wrap_nonce_b64 = try allocator.dupe(u8, nonce),
+            .sse_c_key_md5 = try allocator.dupe(u8, sse_c_md5),
+            .kms_key_id = try allocator.dupe(u8, kms_key_id),
         };
     }
 

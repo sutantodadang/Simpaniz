@@ -2,9 +2,11 @@
 
 A small, single-binary, S3-compatible object server written in Zig.
 
-**Status:** v0.1.1 — production-grade for single-node workloads behind a
-reverse proxy. See [`COMPATIBILITY.md`](./COMPATIBILITY.md) for the S3
-operation matrix and [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the design.
+**Status:** v0.1.1 — production-grade for single-node, multi-tenant workloads.
+TLS termination, IAM/policy enforcement, and SSE are all in-process; a reverse
+proxy is optional (still useful for RSA certs, TLS 1.2 clients, or LB fan-out).
+See [`COMPATIBILITY.md`](./COMPATIBILITY.md) for the S3 operation matrix and
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the design.
 
 ## Features
 
@@ -18,6 +20,14 @@ operation matrix and [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the design.
   ETag), virtual-host-style addressing, CORS preflight.
 - **AWS Signature V4** — header form and presigned URL form, with
   region binding. Anonymous mode when no credentials are configured.
+- **IAM / policy enforcement** — multi-user credential store at
+  `<DATA_DIR>/.simpaniz-iam/users.json`; AWS-style bucket and inline user
+  policy evaluation (explicit Deny wins, then Allow, default-deny for
+  authenticated non-root users) enforced on every request.
+- **In-process TLS 1.3** — no reverse proxy required; see
+  `SIMPANIZ_TLS_CERT`/`SIMPANIZ_TLS_KEY` below.
+- **Event notifications** — webhook delivery of S3-event-shaped JSON on
+  object create/delete; see `SIMPANIZ_NOTIFY_WEBHOOK` below.
 - **Streaming I/O** — PUT writes are streamed to disk (no full-body
   buffering), GET responses stream from disk via `std.Io.Reader`.
 - **Atomic writes** — tmp + fsync + rename on the same filesystem;
@@ -32,8 +42,8 @@ operation matrix and [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the design.
 - **Docker-ready** — multi-stage Alpine image, non-root user.
 
 See [`SECURITY.md`](./SECURITY.md) for the threat model and deployment
-guidance (TLS, IAM, encryption — all currently delegated to your
-reverse proxy / disk encryption).
+guidance. TLS, IAM/policy enforcement, and SSE are handled in-process;
+full-disk encryption is still recommended for defense-in-depth.
 
 ## Quick start
 
@@ -74,8 +84,9 @@ All configuration is via environment variables.
 | `SIMPANIZ_MASTER_KEY`        | *(empty)*      | Base64 32-byte master key. Required to accept `x-amz-server-side-encryption: AES256`; used to wrap per-object DEKs. |
 | `SIMPANIZ_SCRUB_INTERVAL_S`  | `0`            | Bitrot scrubber interval in seconds. `0` disables. Re-verifies object MD5 in the background. |
 | `SIMPANIZ_LIFECYCLE_INTERVAL_S` | `0`         | Lifecycle sweeper interval in seconds. `0` disables. Expires objects per `?lifecycle` rules. |
-| `SIMPANIZ_TLS_CERT`          | *(empty)*      | Path to TLS certificate (PEM). Setting either TLS var refuses startup until in-process TLS lands. |
-| `SIMPANIZ_TLS_KEY`           | *(empty)*      | Path to TLS private key (PEM).                             |
+| `SIMPANIZ_TLS_CERT`          | *(empty)*      | Path to TLS certificate (PEM). Setting this enables in-process TLS 1.3 — `curl https://...` works with no reverse proxy. Requires `SIMPANIZ_TLS_KEY` too (setting only one refuses startup). Cert must be ECDSA P-256. |
+| `SIMPANIZ_TLS_KEY`           | *(empty)*      | Path to TLS private key (PEM, PKCS#8 or SEC1 P-256).       |
+| `SIMPANIZ_NOTIFY_WEBHOOK`    | *(empty)*      | Webhook URL for event notifications. When set, per-bucket `?notification` config (`PutBucketNotificationConfiguration`) triggers async best-effort HTTP POST of S3-event-shaped JSON on object create/delete. |
 | `SIMPANIZ_NODE_ID`           | *(empty)*      | This node's id when running in cluster mode (e.g. `node-1`). Empty disables cluster mode. |
 | `SIMPANIZ_PEERS`             | *(empty)*      | Comma list of `id@host:port` peers; must include this node. Required in cluster mode. |
 | `SIMPANIZ_EC_K`              | `4`            | Reed-Solomon data shards.                                  |
@@ -85,6 +96,10 @@ All configuration is via environment variables.
 | `SIMPANIZ_CLUSTER_TIMEOUT_MS`| `5000`         | Send/recv timeout (ms) on inter-node TCP connections. |
 | `SIMPANIZ_REPL_TARGETS`      | *(empty)*      | Comma list of `src-bucket=>http://host:port[/dst-bucket]` mappings. Enables async cross-cluster replication. |
 | `SIMPANIZ_REPL_AUTH`         | *(empty)*      | Optional value sent verbatim as `Authorization` header on replication PUTs. |
+| `SIMPANIZ_PROBE_INTERVAL_MS` | `2000`         | Cluster mode: membership health-probe interval (ms). |
+| `SIMPANIZ_PROBE_FAILS`       | `3`            | Cluster mode: consecutive probe failures before a node is marked `down`. |
+| `SIMPANIZ_REBALANCE_INTERVAL_S` | `300`       | Cluster mode: shard-rebalance sweep interval (s). `0` disables the daemon. |
+| `SIMPANIZ_JOIN`              | *(empty)*      | Cluster mode: `1`/`true` — announce this node to configured peers on boot via `POST /_simpaniz/join`. |
 
 ## Endpoints
 
@@ -181,8 +196,10 @@ DATA_DIR/
     .simpaniz-lock/               object retention metadata
     .simpaniz-hold/               legal hold metadata
     .simpaniz-repl/queue.log      cross-cluster replication journal
+    .simpaniz-index/              metadata index: WAL + sorted segment (single-node listing)
     <key>                       object data
     <prefix>/<key>              nested keys reflect on-disk hierarchy
+  .simpaniz-peers.json           dynamically joined cluster peers (persisted across restarts)
 ```
 
 ## Known gaps toward MinIO-level
@@ -190,22 +207,22 @@ DATA_DIR/
 These are real engineering investments — they're documented as
 current limits, not "coming soon":
 
-- **TLS in-process** — terminate at a reverse proxy.
-- **Multi-user IAM, policy enforcement, ACLs, STS.** Bucket policies are
-  stored but not enforced.
-- **SSE completeness.** SSE-S3 exists for single PUT/GET, but multipart,
-  copy-source, default bucket encryption, Range GET on encrypted objects,
-  SSE-KMS, and SSE-C are not complete.
+- **ACLs, STS, external identity (OIDC/LDAP).** IAM/policy enforcement and
+  in-process TLS 1.3 are done; per-object ACLs and STS AssumeRole are not.
+- **External KMS.** SSE-KMS uses a local keyring (master-key wrap), not a
+  pluggable external KMS; no key rotation primitives.
 - **Versioning/lifecycle/object-lock completeness.** Core flows exist, but
   suspended versioning, lifecycle transitions/noncurrent expiry/tag filters,
   and full AWS Object Lock semantics are partial.
-- **Cluster maturity.** Static peer lists, no rebalance/gossip/Raft, no active
-  health probing, full-object EC buffers on PUT/GET, and limited cluster-mode
-  support for advanced bucket features.
-- **Replication maturity.** Cross-cluster replication is best-effort async;
-  event notifications are not implemented.
-- **Large-bucket indexing.** Listings walk and sort the filesystem in memory;
-  a real metadata/index layer is needed for millions of keys.
+- **Cluster maturity.** SWIM-lite membership (active health probing, gossip,
+  dynamic join) and an HRW rebalance daemon now exist, but there's no Raft, no
+  decommission, and limited cluster-mode support for advanced bucket
+  features. EC is stripe-streamed (no more full-object buffers).
+- **Replication maturity.** Cross-cluster replication is best-effort async.
+  Event notifications support webhook only (no Kafka/NATS/AMQP/MQTT targets).
+- **Large-bucket indexing.** Single-node listing is served from a per-bucket
+  LSM-lite index (`.simpaniz-index/`, FS-walk fallback); cluster-mode listing
+  still walks and sorts the filesystem in memory.
 
 These are what turn an "S3-compatible server" into a "distributed
 object store like MinIO" — they're not one-line polish items.

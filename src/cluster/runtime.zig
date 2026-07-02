@@ -14,6 +14,8 @@ const transport_mod = @import("transport.zig");
 const disk = @import("disk_store.zig");
 const replication_mod = @import("replication.zig");
 pub const Replicator = replication_mod.Replicator;
+const membership_mod = @import("membership.zig");
+pub const Membership = membership_mod.Membership;
 
 pub const ObjectMeta = struct {
     shard_size: usize,
@@ -59,8 +61,12 @@ pub const ClusterRuntime = struct {
     http_transport: HttpTransport,
     metrics: HttpTransport.Metrics = .{},
     orchestrator: Orchestrator,
-    /// Owned slice of node-id pointers for orchestrator.
+    /// Owned slice of node-id pointers for orchestrator (init-time
+    /// fallback; live placement goes through `membership` once attached).
     nodes: [][]const u8,
+    /// Cluster membership: health probing, gossip, dynamic join. Always
+    /// non-null when `ClusterRuntime` is constructed (cluster mode).
+    membership: *Membership,
     /// Cross-cluster replicator (null if no targets configured).
     replication: ?*Replicator = null,
 
@@ -75,12 +81,16 @@ pub const ClusterRuntime = struct {
             .http_transport = HttpTransport.init(allocator, config, data_dir),
             .orchestrator = undefined,
             .nodes = undefined,
+            .membership = undefined,
         };
         rt.http_transport.metrics = &rt.metrics;
 
         rt.nodes = try allocator.alloc([]const u8, config.peers.len);
         errdefer allocator.free(rt.nodes);
         for (config.peers, 0..) |p, i| rt.nodes[i] = p.id;
+
+        rt.membership = try Membership.init(allocator, config, data_dir);
+        errdefer rt.membership.deinit();
 
         rt.orchestrator = try Orchestrator.init(
             allocator,
@@ -89,6 +99,9 @@ pub const ClusterRuntime = struct {
             config.ec_m,
             rt.http_transport.transport(),
         );
+        rt.orchestrator.membership = rt.membership;
+        rt.http_transport.membership = rt.membership;
+
         return rt;
     }
 
@@ -97,9 +110,38 @@ pub const ClusterRuntime = struct {
             replication_mod.current_runtime = null;
             r.deinit();
         }
+        self.membership.deinit();
         self.orchestrator.deinit();
         self.allocator.free(self.nodes);
         self.allocator.destroy(self);
+    }
+
+    /// Start the membership health-probe thread. Safe to call once after
+    /// init; the prober never blocks the request path.
+    pub fn startMembership(self: *ClusterRuntime) !void {
+        try self.membership.start(self.http_transport.pinger());
+    }
+
+    /// Announce this node to its configured peers via the internal join
+    /// endpoint (only when `SIMPANIZ_JOIN` is set). Stops at the first
+    /// peer that accepts the join and merges its returned membership view.
+    /// Best-effort: logs and returns on failure rather than erroring the
+    /// caller — a node that can't reach any peer yet still boots and will
+    /// pick up membership via probes/gossip once peers are reachable.
+    pub fn joinCluster(self: *ClusterRuntime) void {
+        if (!self.config.join) return;
+        const self_peer = self.config.peers[self.config.self_index];
+        for (self.config.peers, 0..) |_, i| {
+            if (i == self.config.self_index) continue;
+            const body = self.http_transport.join(i, self_peer.id, self_peer.host, self_peer.port, self.allocator) catch continue;
+            defer self.allocator.free(body);
+            self.membership.mergeGossip(body) catch |e| {
+                std.log.warn("cluster: join response merge failed: {any}", .{e});
+            };
+            std.log.info("cluster: joined via peer {s}", .{self.config.peers[i].id});
+            return;
+        }
+        std.log.warn("cluster: SIMPANIZ_JOIN set but no configured peer accepted the join request", .{});
     }
 
     /// Spin up the SSR worker if `repl_targets_raw` is non-empty.
