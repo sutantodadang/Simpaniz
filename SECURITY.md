@@ -3,16 +3,23 @@
 ## Threat model (current)
 
 - **In scope** — request smuggling, path traversal, unauthorised access via
-  forged signatures, request-size DoS, slowloris.
-- **Out of scope / partial** — external key management, fine-grained IAM,
-  multi-tenant isolation, audit logging beyond access logs, and complete
-  SSE coverage for multipart/copy/range flows.
+  forged signatures, unauthorised access via policy enforcement, request-size
+  DoS, slowloris.
+- **Out of scope / partial** — external key management (KMS), ACLs, STS,
+  multi-tenant isolation beyond IAM policy, audit logging beyond access logs.
 
 ## Network exposure
 
-Simpaniz does **not** terminate TLS. Run it behind a reverse proxy
-(nginx, Caddy, traefik, AWS ALB) and bind it to `127.0.0.1` or a
-private network interface. Example nginx upstream:
+Simpaniz can terminate TLS in-process (TLS 1.3 only, `tls_server.zig`): set
+`SIMPANIZ_TLS_CERT` and `SIMPANIZ_TLS_KEY` (PEM) and `curl https://...` works
+with no reverse proxy. Requirements: TLS 1.3 only (no 1.2 fallback), x25519
+key exchange only, server certificate must be ECDSA P-256 (PKCS#8 or SEC1
+key), no client certificates, no session resumption/0-RTT.
+
+A reverse proxy (nginx, Caddy, traefik, AWS ALB) is still the right choice
+when you need RSA certificates, TLS 1.2 client support, ACME auto-renewal
+(not yet built in — roadmap stretch item), or LB/WAF fan-out. Example nginx
+upstream:
 
 ```nginx
 server {
@@ -42,14 +49,23 @@ Simpaniz implements AWS Signature V4 verification:
 - **Presigned form** — query parameters `X-Amz-Algorithm`,
   `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
   `X-Amz-SignedHeaders`, `X-Amz-Signature` are all honoured.
-- **Single credential** — only one `(access key, secret key)` pair is
-  configured via env (`SIMPANIZ_ACCESS_KEY`, `SIMPANIZ_SECRET_KEY`). Multi-user
-  IAM is on the deferred list.
+- **Root credential** — one `(access key, secret key)` pair configured via env
+  (`SIMPANIZ_ACCESS_KEY`, `SIMPANIZ_SECRET_KEY`) or auto-generated on first
+  launch. Root always bypasses IAM policy (MinIO-style).
+- **Multi-user IAM** — additional users are loaded from
+  `<DATA_DIR>/.simpaniz-iam/users.json` (`{"users":[{"access_key",
+  "secret_key","enabled","policy":{...}}]}`). Bucket policies (`PutBucketPolicy`)
+  and each user's inline policy are **enforced on every request** after SigV4
+  verification, before the handler runs: explicit `Deny` wins over `Allow`;
+  authenticated non-root users default-deny absent a grant; statements with a
+  `Condition` are skipped for `Allow` (can't safely assume it holds) but still
+  applied for `Deny` (fail closed). `/healthz`, `/metrics`, `/console/` are
+  exempt from policy checks.
 - **Region binding** — `SIMPANIZ_REGION` is part of the signing context;
   signatures from a different region are rejected.
 - **Anonymous mode** — when `SIMPANIZ_ACCESS_KEY` is unset, the server
-  serves anonymous requests. **Do not run anonymous mode on a
-  network anyone else can reach.**
+  serves anonymous requests, default-allow unless a bucket policy denies.
+  **Do not run anonymous mode on a network anyone else can reach.**
 
 ## Path traversal
 
@@ -96,9 +112,12 @@ Header parsing aborts immediately on:
 
 ## What Simpaniz does NOT do (yet)
 
-- **No external key management.** SSE-S3 can be enabled with
-  `SIMPANIZ_MASTER_KEY`, but KMS integration, SSE-C, key rotation, and full
-  encrypted multipart/copy/range support are not complete. Use full-disk
+- **No external key management.** SSE-S3/SSE-C/SSE-KMS are complete for
+  single-object PUT/GET, multipart, copy-source, Range GET, and default
+  bucket encryption (`?encryption` subresource) — but SSE-KMS uses a local
+  keyring (master-key wrap under `SIMPANIZ_MASTER_KEY`) rather than an
+  external KMS, and there's no key rotation. SSE-C accepts customer-provided
+  keys via request headers, MD5-validated, key never persisted. Use full-disk
   encryption (LUKS, BitLocker, EBS encryption) on the data volume for broader
   protection.
 - **No audit log retention policy.** The JSON access log is written

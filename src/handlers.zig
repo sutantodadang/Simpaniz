@@ -12,6 +12,8 @@ const storage = @import("storage.zig");
 const xml = @import("xml.zig");
 const util = @import("util.zig");
 const cluster = @import("cluster.zig");
+const events = @import("events.zig");
+const index_mod = @import("index.zig");
 
 pub const HandlerContext = struct {
     data_dir: std.fs.Dir,
@@ -24,6 +26,11 @@ pub const HandlerContext = struct {
     cluster: ?*cluster.ClusterRuntime = null,
     /// Body cap (mirrors server config) — used by cluster PUT to bound buffer.
     max_body_bytes: usize = 5 * 1024 * 1024 * 1024,
+    /// Event notification dispatcher, or null when no webhook is configured.
+    notifier: ?*events.Notifier = null,
+    /// Persistent object-listing index. ponytail: index is single-node only;
+    /// cluster mode (ctx.cluster != null) always falls back to the FS walk.
+    index: ?*index_mod.Manager = null,
 };
 
 // ── Bucket-level ─────────────────────────────────────────────────────────────
@@ -39,6 +46,13 @@ pub fn createBucket(ctx: HandlerContext, bucket: []const u8) http.Response {
 }
 
 pub fn deleteBucket(ctx: HandlerContext, bucket: []const u8) http.Response {
+    // Drop the index's on-disk state *before* the storage-layer delete: the
+    // bucket dir's final `deleteDir` requires it to be fully empty, and
+    // storage/buckets.zig doesn't know about `.simpaniz-index/`. Self-heals
+    // (rebuilds) on next access if the bucket delete below then fails.
+    if (ctx.cluster == null) {
+        if (ctx.index) |ix| ix.dropBucket(bucket);
+    }
     storage.deleteBucket(ctx.data_dir, bucket) catch |e| return mapErr(ctx, e, bucket);
     if (ctx.cluster) |cr| {
         cr.replicateBucket(bucket, .delete) catch {};
@@ -80,13 +94,30 @@ pub fn listObjects(ctx: HandlerContext, bucket: []const u8, query: []const u8) h
     const dec_cont = util.urlDecode(ctx.allocator, cont_token) catch cont_token;
     const dec_start = util.urlDecode(ctx.allocator, start_after) catch start_after;
 
-    const page = storage.listObjects(ctx.data_dir, ctx.allocator, bucket, .{
+    const opts: storage.ListOpts = .{
         .prefix = dec_prefix,
         .delimiter = dec_delim,
         .continuation_token = dec_cont,
         .start_after = dec_start,
         .max_keys = max_keys,
-    }) catch |e| return mapErr(ctx, e, bucket);
+    };
+
+    // ponytail: index is single-node; cluster listing still walks.
+    var page: storage.ListPage = undefined;
+    var used_index = false;
+    if (ctx.cluster == null) {
+        if (ctx.index) |ix| {
+            if (ix.list(ctx.allocator, bucket, opts)) |p| {
+                page = p;
+                used_index = true;
+            } else |e| {
+                std.log.warn("index: list failed bucket={s} err={s}, falling back to fs walk", .{ bucket, @errorName(e) });
+            }
+        }
+    }
+    if (!used_index) {
+        page = storage.listObjects(ctx.data_dir, ctx.allocator, bucket, opts) catch |e| return mapErr(ctx, e, bucket);
+    }
 
     const body = xml.buildListObjects(ctx.allocator, .{
         .bucket = bucket,
@@ -112,7 +143,7 @@ pub fn putObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
 
     // CopyObject when x-amz-copy-source is present.
     if (req.header("x-amz-copy-source")) |src| {
-        return copyObject(ctx, bucket, key, src);
+        return copyObject(ctx, bucket, key, src, req);
     }
 
     // Object Lock: block overwrite if currently protected.
@@ -132,18 +163,12 @@ pub fn putObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
         break :blk true;
     };
 
-    // SSE-S3 requested via x-amz-server-side-encryption: AES256.
-    var sse_key: ?*const [32]u8 = null;
-    if (req.header("x-amz-server-side-encryption")) |sse_alg| {
-        if (!std.mem.eql(u8, sse_alg, "AES256")) {
-            return errResp(ctx, 400, "Bad Request", "InvalidArgument", "Unsupported SSE algorithm", key);
-        }
-        if (ctx.master_key) |mk| {
-            sse_key = mk;
-        } else {
-            return errResp(ctx, 501, "Not Implemented", "ServerSideEncryptionConfigurationNotFoundError", "SSE not configured (set SIMPANIZ_MASTER_KEY)", key);
-        }
-    }
+    var customer_key_buf: [32]u8 = undefined;
+    const sse_res = resolvePutSse(ctx, bucket, key, req, &customer_key_buf);
+    const sse_info = switch (sse_res) {
+        .err => |resp| return resp,
+        .ok => |v| v,
+    };
 
     const meta = storage.putObjectStreaming(ctx.data_dir, ctx.allocator, .{
         .bucket = bucket,
@@ -152,7 +177,10 @@ pub fn putObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
         .content_length = req.content_length,
         .expected_md5_b64 = md5_hdr,
         .expected_sha256_hex = sha_hdr,
-        .master_key = sse_key,
+        .master_key = sse_info.wrap_key,
+        .sse_alg = sse_info.alg,
+        .sse_c_key_md5 = sse_info.sse_c_key_md5,
+        .kms_key_id = sse_info.kms_key_id,
     }, req.body_reader) catch |e| return mapErr(ctx, e, key);
     // Tell the server we consumed the body so it doesn't try to drain.
     req.body_consumed = req.content_length;
@@ -163,12 +191,153 @@ pub fn putObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
         applyDefaultRetention(ctx, bucket, key);
     }
 
+    // ponytail: index is single-node; cluster listing still walks.
+    if (ctx.cluster == null) {
+        if (ctx.index) |ix| ix.noteUpsert(bucket, key, meta.size, meta.mtime_ns, meta.etag);
+    }
+
+    if (ctx.notifier) |n| {
+        n.fire(.{ .bucket = bucket, .key = key, .name = .created_put, .size = meta.size, .etag = meta.etag });
+    }
+
     var hdrs_list = std.ArrayList([]const u8){};
     hdrs_list.append(ctx.allocator, std.fmt.allocPrint(ctx.allocator, "ETag: \"{s}\"", .{meta.etag}) catch "") catch {};
-    if (sse_key != null) {
-        hdrs_list.append(ctx.allocator, std.fmt.allocPrint(ctx.allocator, "x-amz-server-side-encryption: AES256", .{}) catch "") catch {};
-    }
+    for (sse_info.resp_headers) |h| hdrs_list.append(ctx.allocator, h) catch {};
     return .{ .status = 200, .status_text = "OK", .extra_headers = hdrs_list.toOwnedSlice(ctx.allocator) catch &.{} };
+}
+
+const PutSse = struct {
+    wrap_key: ?*const [32]u8 = null,
+    alg: []const u8 = "AES256",
+    sse_c_key_md5: []const u8 = "",
+    kms_key_id: []const u8 = "",
+    resp_headers: []const []const u8 = &.{},
+};
+
+const PutSseResult = union(enum) { ok: PutSse, err: http.Response };
+
+/// Resolve server-side encryption for a PUT: explicit SSE-C headers, or
+/// explicit x-amz-server-side-encryption, or (if neither) the bucket's
+/// default encryption config. `customer_key_buf` is caller-owned storage for
+/// the decoded SSE-C key (its lifetime must cover the subsequent
+/// putObjectStreaming call).
+fn resolvePutSse(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: *http.Request, customer_key_buf: *[32]u8) PutSseResult {
+    const explicit_sse = req.header("x-amz-server-side-encryption");
+    const ssec_alg = req.header("x-amz-server-side-encryption-customer-algorithm");
+    const ssec_key = req.header("x-amz-server-side-encryption-customer-key");
+    const ssec_md5 = req.header("x-amz-server-side-encryption-customer-key-md5");
+    const has_ssec = ssec_alg != null or ssec_key != null or ssec_md5 != null;
+
+    if (explicit_sse != null and has_ssec) {
+        return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "Cannot combine x-amz-server-side-encryption with SSE-C headers", key) };
+    }
+
+    if (has_ssec) {
+        const alg = ssec_alg orelse return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidRequest", "Missing SSE-C customer algorithm header", key) };
+        const key_b64 = ssec_key orelse return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidRequest", "Missing SSE-C customer key header", key) };
+        const md5_b64 = ssec_md5 orelse return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidRequest", "Missing SSE-C customer key MD5 header", key) };
+        if (!std.mem.eql(u8, alg, "AES256")) {
+            return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "Unsupported SSE-C algorithm", key) };
+        }
+        const sse_internal = @import("storage/internal.zig");
+        const key_bytes = sse_internal.decodeBase64(ctx.allocator, key_b64) catch {
+            return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "Bad SSE-C key encoding", key) };
+        };
+        defer ctx.allocator.free(key_bytes);
+        if (key_bytes.len != 32) {
+            return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "SSE-C key must decode to 32 bytes", key) };
+        }
+        var digest: [16]u8 = undefined;
+        std.crypto.hash.Md5.hash(key_bytes, &digest, .{});
+        const b64_enc = std.base64.standard.Encoder;
+        var computed_buf: [24]u8 = undefined;
+        const computed = b64_enc.encode(&computed_buf, &digest);
+        if (!std.mem.eql(u8, computed, md5_b64)) {
+            return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "SSE-C key MD5 mismatch", key) };
+        }
+        customer_key_buf.* = key_bytes[0..32].*;
+        const md5_owned = ctx.allocator.dupe(u8, md5_b64) catch md5_b64;
+        var hdrs = std.ArrayList([]const u8){};
+        hdrs.append(ctx.allocator, "x-amz-server-side-encryption-customer-algorithm: AES256") catch {};
+        hdrs.append(ctx.allocator, std.fmt.allocPrint(ctx.allocator, "x-amz-server-side-encryption-customer-key-md5: {s}", .{md5_owned}) catch "") catch {};
+        return .{ .ok = .{
+            .wrap_key = customer_key_buf,
+            .alg = "SSE-C",
+            .sse_c_key_md5 = md5_owned,
+            .resp_headers = hdrs.toOwnedSlice(ctx.allocator) catch &.{},
+        } };
+    }
+
+    if (explicit_sse) |alg| {
+        if (!std.mem.eql(u8, alg, "AES256") and !std.mem.eql(u8, alg, "aws:kms")) {
+            return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "Unsupported SSE algorithm", key) };
+        }
+        const mk = ctx.master_key orelse return .{ .err = errResp(ctx, 501, "Not Implemented", "ServerSideEncryptionConfigurationNotFoundError", "SSE not configured (set SIMPANIZ_MASTER_KEY)", key) };
+        var kms_id: []const u8 = "";
+        var hdrs = std.ArrayList([]const u8){};
+        hdrs.append(ctx.allocator, std.fmt.allocPrint(ctx.allocator, "x-amz-server-side-encryption: {s}", .{alg}) catch "") catch {};
+        if (std.mem.eql(u8, alg, "aws:kms")) {
+            kms_id = req.header("x-amz-server-side-encryption-aws-kms-key-id") orelse "arn:simpaniz:kms:::key/local";
+            hdrs.append(ctx.allocator, std.fmt.allocPrint(ctx.allocator, "x-amz-server-side-encryption-aws-kms-key-id: {s}", .{kms_id}) catch "") catch {};
+        }
+        return .{ .ok = .{ .wrap_key = mk, .alg = alg, .kms_key_id = kms_id, .resp_headers = hdrs.toOwnedSlice(ctx.allocator) catch &.{} } };
+    }
+
+    // No explicit header — fall back to the bucket's default encryption config.
+    var buf: [4096]u8 = undefined;
+    if (storage.defaultEncryptionAlgorithm(ctx.data_dir, bucket, &buf)) |alg| {
+        const mk = ctx.master_key orelse return .{ .err = errResp(ctx, 501, "Not Implemented", "ServerSideEncryptionConfigurationNotFoundError", "SSE not configured (set SIMPANIZ_MASTER_KEY)", key) };
+        const alg_str: []const u8 = switch (alg) {
+            .aes256 => "AES256",
+            .aws_kms => "aws:kms",
+        };
+        var kms_id: []const u8 = "";
+        var hdrs = std.ArrayList([]const u8){};
+        hdrs.append(ctx.allocator, std.fmt.allocPrint(ctx.allocator, "x-amz-server-side-encryption: {s}", .{alg_str}) catch "") catch {};
+        if (alg == .aws_kms) {
+            kms_id = "arn:simpaniz:kms:::key/local";
+            hdrs.append(ctx.allocator, std.fmt.allocPrint(ctx.allocator, "x-amz-server-side-encryption-aws-kms-key-id: {s}", .{kms_id}) catch "") catch {};
+        }
+        return .{ .ok = .{ .wrap_key = mk, .alg = alg_str, .kms_key_id = kms_id, .resp_headers = hdrs.toOwnedSlice(ctx.allocator) catch &.{} } };
+    }
+
+    return .{ .ok = .{} };
+}
+
+/// Validate the SSE-C headers on a read (GET/HEAD) against the object's
+/// stored customer-key MD5. Returns the decoded 32-byte key on success.
+fn requireSseCKey(ctx: HandlerContext, key: []const u8, req: *http.Request, stored_md5: []const u8) union(enum) { ok: [32]u8, err: http.Response } {
+    const alg = req.header("x-amz-server-side-encryption-customer-algorithm") orelse
+        return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidRequest", "Missing SSE-C customer algorithm header", key) };
+    const key_b64 = req.header("x-amz-server-side-encryption-customer-key") orelse
+        return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidRequest", "Missing SSE-C customer key header", key) };
+    const md5_b64 = req.header("x-amz-server-side-encryption-customer-key-md5") orelse
+        return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidRequest", "Missing SSE-C customer key MD5 header", key) };
+    if (!std.mem.eql(u8, alg, "AES256")) {
+        return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "Unsupported SSE-C algorithm", key) };
+    }
+    if (!std.mem.eql(u8, md5_b64, stored_md5)) {
+        return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "SSE-C key MD5 mismatch", key) };
+    }
+    const sse_internal = @import("storage/internal.zig");
+    const key_bytes = sse_internal.decodeBase64(ctx.allocator, key_b64) catch {
+        return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "Bad SSE-C key encoding", key) };
+    };
+    defer ctx.allocator.free(key_bytes);
+    if (key_bytes.len != 32) {
+        return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "SSE-C key must decode to 32 bytes", key) };
+    }
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(key_bytes, &digest, .{});
+    const b64_enc = std.base64.standard.Encoder;
+    var computed_buf: [24]u8 = undefined;
+    const computed = b64_enc.encode(&computed_buf, &digest);
+    if (!std.mem.eql(u8, computed, md5_b64)) {
+        return .{ .err = errResp(ctx, 400, "Bad Request", "InvalidArgument", "SSE-C key MD5 mismatch", key) };
+    }
+    var out: [32]u8 = undefined;
+    @memcpy(&out, key_bytes[0..32]);
+    return .{ .ok = out };
 }
 
 fn applyDefaultRetention(ctx: HandlerContext, bucket: []const u8, key: []const u8) void {
@@ -185,7 +354,7 @@ fn applyDefaultRetention(ctx: HandlerContext, bucket: []const u8, key: []const u
     storage.putObjectRetention(bd, ctx.allocator, key, .{ .mode = mode, .retain_until_ns = until_ns }) catch {};
 }
 
-pub fn copyObject(ctx: HandlerContext, dst_bucket: []const u8, dst_key: []const u8, raw_src: []const u8) http.Response {
+pub fn copyObject(ctx: HandlerContext, dst_bucket: []const u8, dst_key: []const u8, raw_src: []const u8, req: *http.Request) http.Response {
     // Parse "/srcBucket/srcKey" or "srcBucket/srcKey".
     const src = if (raw_src.len > 0 and raw_src[0] == '/') raw_src[1..] else raw_src;
     const slash = std.mem.indexOfScalar(u8, src, '/') orelse return errResp(ctx, 400, "Bad Request", "InvalidArgument", "Bad x-amz-copy-source", dst_key);
@@ -193,11 +362,60 @@ pub fn copyObject(ctx: HandlerContext, dst_bucket: []const u8, dst_key: []const 
     const enc_src_key = src[slash + 1 ..];
     const src_key = util.urlDecode(ctx.allocator, enc_src_key) catch enc_src_key;
 
-    const meta = storage.copyObject(ctx.data_dir, ctx.allocator, src_bucket, src_key, dst_bucket, dst_key, null) catch |e| return mapErr(ctx, e, dst_key);
+    // Resolve destination SSE: explicit header on the copy request, else the
+    // destination bucket's default encryption config.
+    var dst_wrap_key: ?*const [32]u8 = null;
+    var dst_alg: []const u8 = "AES256";
+    var kms_id: []const u8 = "";
+    const a = ctx.allocator;
+
+    if (req.header("x-amz-server-side-encryption")) |alg| {
+        if (!std.mem.eql(u8, alg, "AES256") and !std.mem.eql(u8, alg, "aws:kms")) {
+            return errResp(ctx, 400, "Bad Request", "InvalidArgument", "Unsupported SSE algorithm", dst_key);
+        }
+        const mk = ctx.master_key orelse return errResp(ctx, 501, "Not Implemented", "ServerSideEncryptionConfigurationNotFoundError", "SSE not configured (set SIMPANIZ_MASTER_KEY)", dst_key);
+        dst_wrap_key = mk;
+        dst_alg = alg;
+        if (std.mem.eql(u8, alg, "aws:kms")) {
+            kms_id = req.header("x-amz-server-side-encryption-aws-kms-key-id") orelse "arn:simpaniz:kms:::key/local";
+        }
+    } else {
+        var buf: [4096]u8 = undefined;
+        if (storage.defaultEncryptionAlgorithm(ctx.data_dir, dst_bucket, &buf)) |alg| {
+            const mk = ctx.master_key orelse return errResp(ctx, 501, "Not Implemented", "ServerSideEncryptionConfigurationNotFoundError", "SSE not configured (set SIMPANIZ_MASTER_KEY)", dst_key);
+            dst_wrap_key = mk;
+            dst_alg = switch (alg) {
+                .aes256 => "AES256",
+                .aws_kms => "aws:kms",
+            };
+            if (alg == .aws_kms) kms_id = "arn:simpaniz:kms:::key/local";
+        }
+    }
+
+    const meta = storage.copyObject(ctx.data_dir, ctx.allocator, src_bucket, src_key, dst_bucket, dst_key, null, .{
+        .src_unwrap_key = ctx.master_key,
+        .dst_wrap_key = dst_wrap_key,
+        .dst_sse_alg = dst_alg,
+        .dst_kms_key_id = kms_id,
+    }) catch |e| return mapErr(ctx, e, dst_key);
+    // ponytail: index is single-node; cluster listing still walks.
+    if (ctx.cluster == null) {
+        if (ctx.index) |ix| ix.noteUpsert(dst_bucket, dst_key, meta.size, meta.mtime_ns, meta.etag);
+    }
+    if (ctx.notifier) |n| {
+        n.fire(.{ .bucket = dst_bucket, .key = dst_key, .name = .created_copy, .size = meta.size, .etag = meta.etag });
+    }
+
+    var hdrs_list = std.ArrayList([]const u8){};
+    if (dst_wrap_key != null) {
+        hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption: {s}", .{dst_alg}) catch "") catch {};
+        if (kms_id.len > 0) hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption-aws-kms-key-id: {s}", .{kms_id}) catch "") catch {};
+    }
+
     var lm_buf: [32]u8 = undefined;
     const lm = util.formatIso8601(&lm_buf, meta.mtime_ns);
     const body = xml.buildCopyObjectResult(ctx.allocator, meta.etag, lm) catch return internal(ctx, dst_key);
-    return .{ .status = 200, .status_text = "OK", .body = .{ .bytes = body } };
+    return .{ .status = 200, .status_text = "OK", .body = .{ .bytes = body }, .extra_headers = hdrs_list.toOwnedSlice(a) catch &.{} };
 }
 
 pub fn getObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: *http.Request) http.Response {
@@ -229,52 +447,97 @@ pub fn getObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
         }
     }
 
-    // SSE: Range over encrypted objects is not supported in this cut.
-    if (meta.encryption != null and req.header("range") != null) {
-        file.close();
-        return errResp(ctx, 501, "Not Implemented", "NotImplemented", "Range requests on SSE-encrypted objects are not yet supported", key);
-    }
-
-    // SSE: stream-decrypt path.
+    // SSE: stream-decrypt path (supports Range).
     if (meta.encryption) |enc| {
-        const mk = ctx.master_key orelse {
-            file.close();
-            return errResp(ctx, 500, "Internal Server Error", "InternalError", "Master key not configured but object is encrypted", key);
-        };
+        const a = ctx.allocator;
         const sse = @import("storage/sse.zig");
         const sse_internal = @import("storage/internal.zig");
-        const wrapped_raw = sse_internal.decodeBase64(ctx.allocator, enc.wrapped_dek_b64) catch {
-            file.close();
-            return internal(ctx, key);
-        };
-        const nonce_raw = sse_internal.decodeBase64(ctx.allocator, enc.wrap_nonce_b64) catch {
-            file.close();
-            return internal(ctx, key);
-        };
-        if (wrapped_raw.len != sse.wrapped_dek_len or nonce_raw.len != sse.nonce_size) {
-            file.close();
-            return internal(ctx, key);
+        var dek: [32]u8 = undefined;
+        var sse_resp_hdrs = std.ArrayList([]const u8){};
+
+        if (std.mem.eql(u8, enc.alg, "SSE-C")) {
+            const check = requireSseCKey(ctx, key, req, enc.sse_c_key_md5);
+            const ckey = switch (check) {
+                .err => |resp| {
+                    file.close();
+                    return resp;
+                },
+                .ok => |k| k,
+            };
+            const wrapped_raw = sse_internal.decodeBase64(a, enc.wrapped_dek_b64) catch {
+                file.close();
+                return internal(ctx, key);
+            };
+            const nonce_raw = sse_internal.decodeBase64(a, enc.wrap_nonce_b64) catch {
+                file.close();
+                return internal(ctx, key);
+            };
+            if (wrapped_raw.len != sse.wrapped_dek_len or nonce_raw.len != sse.nonce_size) {
+                file.close();
+                return internal(ctx, key);
+            }
+            dek = sse.unwrapDek(&ckey, wrapped_raw[0..sse.wrapped_dek_len], nonce_raw[0..sse.nonce_size]) catch {
+                file.close();
+                return errResp(ctx, 500, "Internal Server Error", "InternalError", "Failed to unwrap data key", key);
+            };
+            sse_resp_hdrs.append(a, "x-amz-server-side-encryption-customer-algorithm: AES256") catch {};
+            sse_resp_hdrs.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption-customer-key-md5: {s}", .{enc.sse_c_key_md5}) catch "") catch {};
+        } else {
+            const mk = ctx.master_key orelse {
+                file.close();
+                return errResp(ctx, 500, "Internal Server Error", "InternalError", "Master key not configured but object is encrypted", key);
+            };
+            const wrapped_raw = sse_internal.decodeBase64(a, enc.wrapped_dek_b64) catch {
+                file.close();
+                return internal(ctx, key);
+            };
+            const nonce_raw = sse_internal.decodeBase64(a, enc.wrap_nonce_b64) catch {
+                file.close();
+                return internal(ctx, key);
+            };
+            if (wrapped_raw.len != sse.wrapped_dek_len or nonce_raw.len != sse.nonce_size) {
+                file.close();
+                return internal(ctx, key);
+            }
+            dek = sse.unwrapDek(mk, wrapped_raw[0..sse.wrapped_dek_len], nonce_raw[0..sse.nonce_size]) catch {
+                file.close();
+                return errResp(ctx, 500, "Internal Server Error", "InternalError", "Failed to unwrap data key", key);
+            };
+            sse_resp_hdrs.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption: {s}", .{enc.alg}) catch "") catch {};
+            if (std.mem.eql(u8, enc.alg, "aws:kms") and enc.kms_key_id.len > 0) {
+                sse_resp_hdrs.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption-aws-kms-key-id: {s}", .{enc.kms_key_id}) catch "") catch {};
+            }
         }
-        const wrapped_arr: *const [sse.wrapped_dek_len]u8 = wrapped_raw[0..sse.wrapped_dek_len];
-        const nonce_arr: *const [sse.nonce_size]u8 = nonce_raw[0..sse.nonce_size];
-        const dek = sse.unwrapDek(mk, wrapped_arr, nonce_arr) catch {
-            file.close();
-            return errResp(ctx, 500, "Internal Server Error", "InternalError", "Failed to unwrap data key", key);
-        };
+
+        var status: u16 = 200;
+        var status_text: []const u8 = "OK";
+        var offset: u64 = 0;
+        var length: u64 = total;
+        if (req.header("range")) |range| {
+            if (parseRange(range, total)) |r| {
+                offset = r.start;
+                length = r.end - r.start + 1;
+                status = 206;
+                status_text = "Partial Content";
+            }
+        }
 
         var hdrs_list = std.ArrayList([]const u8){};
-        const a = ctx.allocator;
         hdrs_list.append(a, std.fmt.allocPrint(a, "ETag: \"{s}\"", .{meta.etag}) catch "") catch {};
+        hdrs_list.append(a, std.fmt.allocPrint(a, "Accept-Ranges: bytes", .{}) catch "") catch {};
         var lm_buf: [32]u8 = undefined;
         const lm = util.formatIso8601(&lm_buf, meta.mtime_ns);
         hdrs_list.append(a, std.fmt.allocPrint(a, "Last-Modified: {s}", .{lm}) catch "") catch {};
-        hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption: AES256", .{}) catch "") catch {};
+        if (status == 206) {
+            hdrs_list.append(a, std.fmt.allocPrint(a, "Content-Range: bytes {d}-{d}/{d}", .{ offset, offset + length - 1, total }) catch "") catch {};
+        }
+        for (sse_resp_hdrs.items) |h| hdrs_list.append(a, h) catch {};
 
         return .{
-            .status = 200,
-            .status_text = "OK",
+            .status = status,
+            .status_text = status_text,
             .content_type = meta.content_type,
-            .body = .{ .encrypted_file = .{ .file = file, .plaintext_length = total, .dek = dek, .owns_file = true } },
+            .body = .{ .encrypted_file = .{ .file = file, .plaintext_length = total, .dek = dek, .owns_file = true, .offset = offset, .length = length } },
             .extra_headers = hdrs_list.toOwnedSlice(a) catch &.{},
         };
     }
@@ -331,6 +594,24 @@ pub fn headObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req:
     hdrs_list.append(a, std.fmt.allocPrint(a, "Last-Modified: {s}", .{lm}) catch "") catch {};
     // Override content-length so HEAD reports object size, not 0 body.
     hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-actual-length: {d}", .{meta.size}) catch "") catch {};
+
+    if (meta.encryption) |enc| {
+        if (std.mem.eql(u8, enc.alg, "SSE-C")) {
+            const check = requireSseCKey(ctx, key, req, enc.sse_c_key_md5);
+            switch (check) {
+                .err => |resp| return resp,
+                .ok => {},
+            }
+            hdrs_list.append(a, "x-amz-server-side-encryption-customer-algorithm: AES256") catch {};
+            hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption-customer-key-md5: {s}", .{enc.sse_c_key_md5}) catch "") catch {};
+        } else {
+            hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption: {s}", .{enc.alg}) catch "") catch {};
+            if (std.mem.eql(u8, enc.alg, "aws:kms") and enc.kms_key_id.len > 0) {
+                hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption-aws-kms-key-id: {s}", .{enc.kms_key_id}) catch "") catch {};
+            }
+        }
+    }
+
     const hdrs = hdrs_list.toOwnedSlice(a) catch &.{};
     return .{ .status = 200, .status_text = "OK", .content_type = meta.content_type, .extra_headers = hdrs };
 }
@@ -361,6 +642,13 @@ pub fn deleteObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, re
         defer bd.close();
         const vid = storage.addDeleteMarker(bd, ctx.allocator, key) catch |e| return mapErr(ctx, e, key);
         storage.deleteObject(ctx.data_dir, ctx.allocator, bucket, key) catch {};
+        // ponytail: index is single-node; cluster listing still walks.
+        if (ctx.cluster == null) {
+            if (ctx.index) |ix| ix.noteDelete(bucket, key);
+        }
+        if (ctx.notifier) |n| {
+            n.fire(.{ .bucket = bucket, .key = key, .name = .removed_delete_marker, .size = 0, .etag = "" });
+        }
         const vid_hdr = std.fmt.allocPrint(ctx.allocator, "x-amz-version-id: {s}", .{vid}) catch "";
         const dm_hdr = std.fmt.allocPrint(ctx.allocator, "x-amz-delete-marker: true", .{}) catch "";
         const hdrs = ctx.allocator.dupe([]const u8, &.{ vid_hdr, dm_hdr }) catch &.{};
@@ -372,6 +660,13 @@ pub fn deleteObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, re
         error.ObjectNotFound => {}, // S3 returns 204 even if missing.
         else => return mapErr(ctx, e, key),
     };
+    // ponytail: index is single-node; cluster listing still walks.
+    if (ctx.cluster == null) {
+        if (ctx.index) |ix| ix.noteDelete(bucket, key);
+    }
+    if (ctx.notifier) |n| {
+        n.fire(.{ .bucket = bucket, .key = key, .name = .removed_delete, .size = 0, .etag = "" });
+    }
     return noContent();
 }
 
@@ -558,7 +853,10 @@ pub fn clusterHealth(ctx: HandlerContext) http.Response {
         buf.appendSlice(ctx.allocator, p.id) catch {};
         buf.appendSlice(ctx.allocator, "\"}") catch {};
     }
-    buf.appendSlice(ctx.allocator, "]}") catch {};
+    buf.appendSlice(ctx.allocator, "],\"membership\":") catch {};
+    const membership_json = cr.membership.snapshotJson(ctx.allocator) catch "[]";
+    buf.appendSlice(ctx.allocator, membership_json) catch {};
+    buf.appendSlice(ctx.allocator, "}") catch {};
     const body = buf.toOwnedSlice(ctx.allocator) catch return internal(ctx, "/cluster/health");
     return .{ .status = 200, .status_text = "OK", .content_type = "application/json", .body = .{ .bytes = body } };
 }
@@ -646,6 +944,13 @@ pub fn deleteMultiple(ctx: HandlerContext, bucket: []const u8, req: *http.Reques
             },
         };
         deleted.append(ctx.allocator, .{ .key = k }) catch {};
+        // ponytail: index is single-node; cluster listing still walks.
+        if (ctx.cluster == null) {
+            if (ctx.index) |ix| ix.noteDelete(bucket, k);
+        }
+        if (ctx.notifier) |n| {
+            n.fire(.{ .bucket = bucket, .key = k, .name = .removed_delete, .size = 0, .etag = "" });
+        }
     }
 
     const xml_body = xml.buildDeleteResult(ctx.allocator, deleted.items, errors.items, false) catch return internal(ctx, bucket);
@@ -655,9 +960,44 @@ pub fn deleteMultiple(ctx: HandlerContext, bucket: []const u8, req: *http.Reques
 // ── Multipart ────────────────────────────────────────────────────────────────
 
 pub fn createMultipartUpload(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: *http.Request) http.Response {
-    const upload_id = storage.createUpload(ctx.data_dir, ctx.allocator, bucket, key, req.content_type) catch |e| return mapErr(ctx, e, key);
+    const a = ctx.allocator;
+    var sse_alg: []const u8 = "";
+    var kms_id: []const u8 = "";
+
+    if (req.header("x-amz-server-side-encryption")) |alg| {
+        if (!std.mem.eql(u8, alg, "AES256") and !std.mem.eql(u8, alg, "aws:kms")) {
+            return errResp(ctx, 400, "Bad Request", "InvalidArgument", "Unsupported SSE algorithm", key);
+        }
+        if (ctx.master_key == null) {
+            return errResp(ctx, 501, "Not Implemented", "ServerSideEncryptionConfigurationNotFoundError", "SSE not configured (set SIMPANIZ_MASTER_KEY)", key);
+        }
+        sse_alg = alg;
+        if (std.mem.eql(u8, alg, "aws:kms")) {
+            kms_id = req.header("x-amz-server-side-encryption-aws-kms-key-id") orelse "arn:simpaniz:kms:::key/local";
+        }
+    } else {
+        var buf: [4096]u8 = undefined;
+        if (storage.defaultEncryptionAlgorithm(ctx.data_dir, bucket, &buf)) |alg| {
+            if (ctx.master_key == null) {
+                return errResp(ctx, 501, "Not Implemented", "ServerSideEncryptionConfigurationNotFoundError", "SSE not configured (set SIMPANIZ_MASTER_KEY)", key);
+            }
+            sse_alg = switch (alg) {
+                .aes256 => "AES256",
+                .aws_kms => "aws:kms",
+            };
+            if (alg == .aws_kms) kms_id = "arn:simpaniz:kms:::key/local";
+        }
+    }
+
+    const upload_id = storage.createUpload(ctx.data_dir, ctx.allocator, bucket, key, req.content_type, sse_alg) catch |e| return mapErr(ctx, e, key);
     const body = xml.buildInitiateMultipart(ctx.allocator, bucket, key, upload_id) catch return internal(ctx, key);
-    return .{ .status = 200, .status_text = "OK", .body = .{ .bytes = body } };
+
+    var hdrs_list = std.ArrayList([]const u8){};
+    if (sse_alg.len > 0) {
+        hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption: {s}", .{sse_alg}) catch "") catch {};
+        if (kms_id.len > 0) hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-server-side-encryption-aws-kms-key-id: {s}", .{kms_id}) catch "") catch {};
+    }
+    return .{ .status = 200, .status_text = "OK", .body = .{ .bytes = body }, .extra_headers = hdrs_list.toOwnedSlice(a) catch &.{} };
 }
 
 pub fn uploadPart(ctx: HandlerContext, bucket: []const u8, _: []const u8, upload_id: []const u8, part_no: u32, req: *http.Request) http.Response {
@@ -674,7 +1014,14 @@ pub fn completeMultipart(ctx: HandlerContext, bucket: []const u8, key: []const u
     var parts = ctx.allocator.alloc(u32, part_strs.len) catch return internal(ctx, upload_id);
     for (part_strs, 0..) |s, i| parts[i] = std.fmt.parseInt(u32, s, 10) catch 0;
 
-    const meta = storage.completeUpload(ctx.data_dir, ctx.allocator, bucket, upload_id, parts) catch |e| return mapErr(ctx, e, upload_id);
+    const meta = storage.completeUpload(ctx.data_dir, ctx.allocator, bucket, upload_id, parts, ctx.master_key) catch |e| return mapErr(ctx, e, upload_id);
+
+    // ponytail: index is single-node; cluster listing still walks. In
+    // cluster mode the object below gets promoted into the EC ring and the
+    // local copy deleted, so it must never be indexed here.
+    if (ctx.cluster == null) {
+        if (ctx.index) |ix| ix.noteUpsert(bucket, key, meta.size, meta.mtime_ns, meta.etag);
+    }
 
     // In cluster mode, promote the locally-assembled object into the EC ring.
     if (ctx.cluster) |cr| {
@@ -714,6 +1061,10 @@ pub fn completeMultipart(ctx: HandlerContext, bucket: []const u8, key: []const u
         if (cr.replication) |repl| {
             repl.enqueue(bucket, key, etag_fixed, cmeta.original_size, cmeta.last_modified) catch {};
         }
+    }
+
+    if (ctx.notifier) |n| {
+        n.fire(.{ .bucket = bucket, .key = key, .name = .created_complete_multipart, .size = meta.size, .etag = meta.etag });
     }
 
     const location = std.fmt.allocPrint(ctx.allocator, "/{s}/{s}", .{ bucket, key }) catch "";
@@ -784,6 +1135,37 @@ pub fn getBucketPolicy(ctx: HandlerContext, bucket: []const u8) http.Response {
 
 pub fn deleteBucketPolicy(ctx: HandlerContext, bucket: []const u8) http.Response {
     storage.deleteBucketPolicy(ctx.data_dir, bucket) catch |e| return mapErr(ctx, e, bucket);
+    return noContent();
+}
+
+pub fn putBucketNotification(ctx: HandlerContext, bucket: []const u8, req: *http.Request) http.Response {
+    const body = req.readBodyAlloc(ctx.allocator, 256 * 1024) catch return errResp(ctx, 400, "Bad Request", "InvalidRequest", "Notification body too large", bucket);
+    // Empty body clears notifications (no explicit delete endpoint).
+    storage.putBucketNotification(ctx.data_dir, bucket, body) catch |e| return mapErr(ctx, e, bucket);
+    return noContent();
+}
+
+pub fn getBucketNotification(ctx: HandlerContext, bucket: []const u8) http.Response {
+    const maybe = storage.getBucketNotification(ctx.data_dir, ctx.allocator, bucket) catch |e| return mapErr(ctx, e, bucket);
+    const body = maybe orelse "<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>";
+    return .{ .status = 200, .status_text = "OK", .content_type = "application/xml", .body = .{ .bytes = body } };
+}
+
+pub fn putBucketEncryption(ctx: HandlerContext, bucket: []const u8, req: *http.Request) http.Response {
+    const body = req.readBodyAlloc(ctx.allocator, 64 * 1024) catch return errResp(ctx, 400, "Bad Request", "InvalidRequest", "Encryption config body too large", bucket);
+    if (body.len == 0) return errResp(ctx, 400, "Bad Request", "MalformedXML", "Empty encryption config", bucket);
+    storage.putBucketEncryption(ctx.data_dir, bucket, body) catch |e| return mapErr(ctx, e, bucket);
+    return ok();
+}
+
+pub fn getBucketEncryption(ctx: HandlerContext, bucket: []const u8) http.Response {
+    const maybe = storage.getBucketEncryption(ctx.data_dir, ctx.allocator, bucket) catch |e| return mapErr(ctx, e, bucket);
+    const body = maybe orelse return errResp(ctx, 404, "Not Found", "ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found", bucket);
+    return .{ .status = 200, .status_text = "OK", .content_type = "application/xml", .body = .{ .bytes = body } };
+}
+
+pub fn deleteBucketEncryption(ctx: HandlerContext, bucket: []const u8) http.Response {
+    storage.deleteBucketEncryption(ctx.data_dir, bucket) catch |e| return mapErr(ctx, e, bucket);
     return noContent();
 }
 
@@ -970,8 +1352,9 @@ fn clusterPutObject(ctx: HandlerContext, cr: *cluster.ClusterRuntime, bucket: []
         return errResp(ctx, 413, "Payload Too Large", "EntityTooLarge", "Body exceeds limit", key);
     }
 
-    // Stream directly into the encode buffer via Orchestrator.putFromReader.
-    const put_result = cr.orchestrator.putFromReader(bucket, key, req.body_reader, size) catch |e| {
+    // Stream stripe-by-stripe into the EC ring via Orchestrator.putStreaming
+    // — only ~one stripe (a few MiB) is ever buffered, regardless of size.
+    const put_result = cr.orchestrator.putStreaming(bucket, key, req.body_reader, size) catch |e| {
         std.log.warn("cluster put failed: {any}", .{e});
         return errResp(ctx, 500, "Internal Server Error", "InternalError", "Cluster PUT failed", key);
     };
@@ -991,6 +1374,10 @@ fn clusterPutObject(ctx: HandlerContext, cr: *cluster.ClusterRuntime, bucket: []
         return errResp(ctx, 500, "Internal Server Error", "InternalError", "Cluster metadata write failed", key);
     };
 
+    if (ctx.notifier) |n| {
+        n.fire(.{ .bucket = bucket, .key = key, .name = .created_put, .size = meta.original_size, .etag = etag_hex[0..] });
+    }
+
     // Enqueue cross-cluster replication (best-effort; SSR worker handles delivery).
     if (cr.replication) |repl| {
         repl.enqueue(bucket, key, etag_hex, meta.original_size, meta.last_modified) catch |e| {
@@ -1001,6 +1388,26 @@ fn clusterPutObject(ctx: HandlerContext, cr: *cluster.ClusterRuntime, bucket: []
     const etag_hdr = std.fmt.allocPrint(ctx.allocator, "ETag: \"{s}\"", .{etag_hex}) catch "";
     const hdrs = ctx.allocator.dupe([]const u8, &.{etag_hdr}) catch &.{};
     return .{ .status = 200, .status_text = "OK", .extra_headers = hdrs };
+}
+
+/// Adapter bound into `http.Body.ec_stream` so the streaming shard-range
+/// reconstruction (`Orchestrator.getRangeStreaming`) can be invoked from
+/// `http.zig` without that module knowing anything about the cluster
+/// subsystem. Allocated in the request arena — lives exactly as long as the
+/// `http.Response` it's attached to.
+const EcStreamCtx = struct {
+    orch: *cluster.Orchestrator,
+    bucket: []const u8,
+    key: []const u8,
+    chunk: usize,
+    original_size: u64,
+    offset: u64,
+    length: u64,
+};
+
+fn ecStreamFn(ctx_ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
+    const c: *EcStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    try c.orch.getRangeStreaming(c.bucket, c.key, c.chunk, c.original_size, c.offset, c.length, writer);
 }
 
 fn clusterGetObject(ctx: HandlerContext, cr: *cluster.ClusterRuntime, bucket: []const u8, key: []const u8, req: *http.Request) http.Response {
@@ -1022,30 +1429,36 @@ fn clusterGetObject(ctx: HandlerContext, cr: *cluster.ClusterRuntime, bucket: []
         }
     }
 
-    const data = cr.orchestrator.get(bucket, key, meta.shard_size, meta.original_size, ctx.allocator) catch |e| {
-        std.log.warn("cluster get failed: {any}", .{e});
-        return errResp(ctx, 500, "Internal Server Error", "InternalError", "Cluster GET failed", key);
-    };
-
     var status: u16 = 200;
     var status_text: []const u8 = "OK";
-    var slice = data;
     var range_hdr: ?[]const u8 = null;
     const total: u64 = meta.original_size;
+    var start: u64 = 0;
+    var emit_len: u64 = total;
 
     if (req.header("range")) |range| {
         if (parseRange(range, total)) |r| {
-            const start: usize = @intCast(r.start);
-            const end_inclusive: usize = @intCast(r.end);
-            slice = data[start .. end_inclusive + 1];
+            start = r.start;
+            emit_len = r.end - r.start + 1;
             status = 206;
             status_text = "Partial Content";
             range_hdr = std.fmt.allocPrint(ctx.allocator, "Content-Range: bytes {d}-{d}/{d}", .{ r.start, r.end, total }) catch null;
         }
     }
 
-    var hdrs_list = std.ArrayList([]const u8){};
     const a = ctx.allocator;
+    const es_ctx = a.create(EcStreamCtx) catch return internal(ctx, key);
+    es_ctx.* = .{
+        .orch = &cr.orchestrator,
+        .bucket = bucket,
+        .key = key,
+        .chunk = meta.shard_size,
+        .original_size = meta.original_size,
+        .offset = start,
+        .length = emit_len,
+    };
+
+    var hdrs_list = std.ArrayList([]const u8){};
     hdrs_list.append(a, std.fmt.allocPrint(a, "ETag: \"{s}\"", .{meta.etag}) catch "") catch {};
     hdrs_list.append(a, "Accept-Ranges: bytes") catch {};
     var lm_buf: [32]u8 = undefined;
@@ -1056,7 +1469,7 @@ fn clusterGetObject(ctx: HandlerContext, cr: *cluster.ClusterRuntime, bucket: []
         .status = status,
         .status_text = status_text,
         .content_type = a.dupe(u8, meta.content_type) catch "application/octet-stream",
-        .body = .{ .bytes = slice },
+        .body = .{ .ec_stream = .{ .ctx = es_ctx, .stream_fn = ecStreamFn, .length = emit_len } },
         .extra_headers = hdrs_list.toOwnedSlice(a) catch &.{},
     };
 }

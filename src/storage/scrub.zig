@@ -93,6 +93,8 @@ fn freeMeta(allocator: std.mem.Allocator, meta: anytype) void {
         allocator.free(enc.alg);
         allocator.free(enc.wrapped_dek_b64);
         allocator.free(enc.wrap_nonce_b64);
+        allocator.free(enc.sse_c_key_md5);
+        allocator.free(enc.kms_key_id);
     }
 }
 

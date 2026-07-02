@@ -77,6 +77,21 @@ pub fn route(req: *http.Request, ctx: handlers.HandlerContext) http.Response {
                 else => methodNotAllowed(ctx, bucket),
             };
         }
+        if (hasFlag(req.query, "notification")) {
+            return switch (req.method) {
+                .PUT => handlers.putBucketNotification(ctx, bucket, req),
+                .GET => handlers.getBucketNotification(ctx, bucket),
+                else => methodNotAllowed(ctx, bucket),
+            };
+        }
+        if (hasFlag(req.query, "encryption")) {
+            return switch (req.method) {
+                .PUT => handlers.putBucketEncryption(ctx, bucket, req),
+                .GET => handlers.getBucketEncryption(ctx, bucket),
+                .DELETE => handlers.deleteBucketEncryption(ctx, bucket),
+                else => methodNotAllowed(ctx, bucket),
+            };
+        }
         if (req.method == .GET and hasFlag(req.query, "versions")) {
             return handlers.listObjectVersions(ctx, bucket, req);
         }
@@ -159,7 +174,7 @@ fn methodNotAllowed(ctx: handlers.HandlerContext, resource: []const u8) http.Res
     return .{ .status = 405, .status_text = "Method Not Allowed", .body = .{ .bytes = body } };
 }
 
-fn splitBucketKey(req: *const http.Request, bucket: *[]const u8, key: *[]const u8) void {
+pub fn splitBucketKey(req: *const http.Request, bucket: *[]const u8, key: *[]const u8) void {
     // Try virtual-host style: Host header begins with <bucket>.
     if (req.header("host")) |host_full| {
         const host = if (std.mem.indexOfScalar(u8, host_full, ':')) |c| host_full[0..c] else host_full;

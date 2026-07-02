@@ -18,6 +18,8 @@ const internal_handler_mod = @import("cluster/internal_handler.zig");
 const runtime_mod = @import("cluster/runtime.zig");
 const heal_mod = @import("cluster/heal.zig");
 const replication_mod = @import("cluster/replication.zig");
+const membership_mod = @import("cluster/membership.zig");
+const rebalance_mod = @import("cluster/rebalance.zig");
 
 // ── Reed-Solomon erasure coding ─────────────────────────────────────────────
 pub const Codec = reed_solomon_mod.Codec;
@@ -51,6 +53,11 @@ pub const isInternalPath = internal_handler_mod.matches;
 pub const HealDaemon = heal_mod;
 pub const Replicator = replication_mod.Replicator;
 
+// ── Membership + rebalancing ────────────────────────────────────────────────
+pub const Membership = membership_mod.Membership;
+pub const NodeState = membership_mod.NodeState;
+pub const RebalanceDaemon = rebalance_mod;
+
 test {
     const std = @import("std");
     std.testing.refAllDecls(reed_solomon_mod);
@@ -62,4 +69,6 @@ test {
     std.testing.refAllDecls(internal_handler_mod);
     std.testing.refAllDecls(runtime_mod);
     std.testing.refAllDecls(replication_mod);
+    std.testing.refAllDecls(membership_mod);
+    std.testing.refAllDecls(rebalance_mod);
 }

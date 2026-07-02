@@ -8,6 +8,8 @@
 //!   {bucket}/.simpaniz-tmp/                — atomic-write temp area
 //!   {bucket}/.simpaniz-tags/{key}.xml      — object tag set XML
 //!   {bucket}/.simpaniz-policy.json         — bucket policy JSON
+//!   {bucket}/.simpaniz-notify.xml          — bucket event notification config
+//!   {bucket}/.simpaniz-encryption.xml      — bucket default encryption config
 
 pub const meta_dir = ".simpaniz-meta";
 pub const mp_dir = ".simpaniz-mp";
@@ -15,6 +17,8 @@ pub const tmp_dir = ".simpaniz-tmp";
 pub const tags_dir = ".simpaniz-tags";
 pub const reserved_prefix = ".simpaniz-";
 pub const policy_file = ".simpaniz-policy.json";
+pub const notify_file = ".simpaniz-notify.xml";
+pub const encryption_file = ".simpaniz-encryption.xml";
 pub const lifecycle_file = ".simpaniz-lifecycle.xml";
 pub const versioning_file = ".simpaniz-versioning";
 pub const versions_dir = ".simpaniz-versions";

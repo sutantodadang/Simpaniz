@@ -12,6 +12,7 @@ const paths = @import("paths.zig");
 const types = @import("types.zig");
 const internal = @import("internal.zig");
 const sse = @import("sse.zig");
+const buckets = @import("buckets.zig");
 
 const Error = types.Error;
 const ObjectMeta = types.ObjectMeta;
@@ -168,11 +169,13 @@ pub fn putObjectStreaming(
         const nonce_b64 = allocator.alloc(u8, enc_b64.calcSize(w.nonce.len)) catch return error.OutOfMemory;
         _ = enc_b64.encode(nonce_b64, &w.nonce);
         enc_info = .{
-            .alg = "AES256",
+            .alg = input.sse_alg,
             .chunk_size = sse.default_chunk_size,
             .plaintext_size = written,
             .wrapped_dek_b64 = wrapped_b64,
             .wrap_nonce_b64 = nonce_b64,
+            .sse_c_key_md5 = input.sse_c_key_md5,
+            .kms_key_id = input.kms_key_id,
         };
     }
 
@@ -237,8 +240,23 @@ pub fn deleteObject(data_dir: Dir, allocator: Allocator, bucket: []const u8, key
     internal.pruneEmptyParents(bd, tags_path);
 }
 
+/// Options controlling server-side encryption across a copy. `src_unwrap_key`
+/// is the master key, needed only when the source is SSE-S3/SSE-KMS
+/// encrypted (SSE-C sources are not supported by this cut). `dst_wrap_key`
+/// requests encryption of the destination (master key for AES256/aws:kms,
+/// or a customer key for SSE-C); null leaves the destination plaintext.
+pub const CopyOpts = struct {
+    src_unwrap_key: ?*const [32]u8 = null,
+    dst_wrap_key: ?*const [32]u8 = null,
+    dst_sse_alg: []const u8 = "AES256",
+    dst_sse_c_key_md5: []const u8 = "",
+    dst_kms_key_id: []const u8 = "",
+};
+
 /// Copy `src` to `dst`, possibly replacing metadata. Source and destination
 /// can share a bucket. Computes a fresh ETag from the destination contents.
+/// Handles SSE transparently: an encrypted source is decrypted on read, and
+/// the destination is (re-)encrypted per `opts`.
 pub fn copyObject(
     data_dir: Dir,
     allocator: Allocator,
@@ -247,6 +265,7 @@ pub fn copyObject(
     dst_bucket: []const u8,
     dst_key: []const u8,
     new_content_type: ?[]const u8,
+    opts: CopyOpts,
 ) Error!ObjectMeta {
     util.validateObjectKey(src_key) catch return error.InvalidKey;
     util.validateObjectKey(dst_key) catch return error.InvalidKey;
@@ -255,7 +274,6 @@ pub fn copyObject(
     defer src_bd.close();
     var src_file = src_bd.openFile(src_key, .{}) catch return error.ObjectNotFound;
     defer src_file.close();
-    const src_stat = src_file.stat() catch return error.Internal;
 
     const src_meta = internal.readMetadata(src_bd, allocator, src_key) catch return error.Internal;
     defer {
@@ -265,22 +283,58 @@ pub fn copyObject(
             allocator.free(e.alg);
             allocator.free(e.wrapped_dek_b64);
             allocator.free(e.wrap_nonce_b64);
+            allocator.free(e.sse_c_key_md5);
+            allocator.free(e.kms_key_id);
         }
     }
-    // Copying SSE-encrypted source is not supported in this cut (would require
-    // decrypting on read and re-encrypting on write; currently we'd copy the
-    // ciphertext as plaintext, corrupting the destination).
-    if (src_meta.encryption != null) return error.Internal;
     const ct = if (new_content_type) |c| c else src_meta.content_type;
+    // `src_meta.size` is already the plaintext size for both encrypted and
+    // plain objects (see internal.readMetadata).
+    const plaintext_len = src_meta.size;
 
     var read_buf: [64 * 1024]u8 = undefined;
-    var fr = src_file.reader(&read_buf);
 
+    if (src_meta.encryption) |enc| {
+        if (std.mem.eql(u8, enc.alg, "SSE-C")) return error.Internal; // needs customer key, not plumbed through copy
+        const mk = opts.src_unwrap_key orelse return error.Internal;
+        const wrapped_raw = internal.decodeBase64(allocator, enc.wrapped_dek_b64) catch return error.Internal;
+        defer allocator.free(wrapped_raw);
+        const nonce_raw = internal.decodeBase64(allocator, enc.wrap_nonce_b64) catch return error.Internal;
+        defer allocator.free(nonce_raw);
+        if (wrapped_raw.len != sse.wrapped_dek_len or nonce_raw.len != sse.nonce_size) return error.Internal;
+        const dek = sse.unwrapDek(mk, wrapped_raw[0..sse.wrapped_dek_len], nonce_raw[0..sse.nonce_size]) catch return error.Internal;
+
+        // Decrypt the whole object into memory, then feed it as a plain
+        // reader into putObjectStreaming (which re-encrypts if requested).
+        var src_read_buf: [64 * 1024]u8 = undefined;
+        var src_fr = src_file.reader(&src_read_buf);
+        var plain_writer = std.Io.Writer.Allocating.init(allocator);
+        defer plain_writer.deinit();
+        sse.decryptStream(&src_fr.interface, &plain_writer.writer, plaintext_len, &dek) catch return error.Internal;
+        var fixed_reader = std.Io.Reader.fixed(plain_writer.written());
+
+        return putObjectStreaming(data_dir, allocator, .{
+            .bucket = dst_bucket,
+            .key = dst_key,
+            .content_type = ct,
+            .content_length = plaintext_len,
+            .master_key = opts.dst_wrap_key,
+            .sse_alg = opts.dst_sse_alg,
+            .sse_c_key_md5 = opts.dst_sse_c_key_md5,
+            .kms_key_id = opts.dst_kms_key_id,
+        }, &fixed_reader);
+    }
+
+    var fr = src_file.reader(&read_buf);
     return putObjectStreaming(data_dir, allocator, .{
         .bucket = dst_bucket,
         .key = dst_key,
         .content_type = ct,
-        .content_length = src_stat.size,
+        .content_length = plaintext_len,
+        .master_key = opts.dst_wrap_key,
+        .sse_alg = opts.dst_sse_alg,
+        .sse_c_key_md5 = opts.dst_sse_c_key_md5,
+        .kms_key_id = opts.dst_kms_key_id,
     }, &fr.interface);
 }
 
@@ -320,13 +374,6 @@ pub fn listObjects(data_dir: Dir, allocator: Allocator, bucket: []const u8, opts
         }
     }.lt);
 
-    const start_marker: []const u8 = if (opts.continuation_token.len > 0)
-        opts.continuation_token
-    else if (opts.start_after.len > 0)
-        opts.start_after
-    else
-        "";
-
     var objects = std.ArrayList(xml.ObjectInfo){};
     var prefixes_set = std.StringArrayHashMap(void).init(allocator);
     defer prefixes_set.deinit();
@@ -345,7 +392,15 @@ pub fn listObjects(data_dir: Dir, allocator: Allocator, bucket: []const u8, opts
     var next_token: []const u8 = "";
 
     for (all.items) |key| {
-        if (start_marker.len > 0 and !std.mem.lessThan(u8, start_marker, key)) continue;
+        // Resume semantics: `continuation_token` is INCLUSIVE (it is the
+        // first key that was NOT emitted on the previous page, so it must be
+        // emitted now — a strict-greater filter here silently dropped one
+        // key per truncated page). `start_after` stays EXCLUSIVE per S3.
+        if (opts.continuation_token.len > 0) {
+            if (std.mem.lessThan(u8, key, opts.continuation_token)) continue; // resume AT token
+        } else if (opts.start_after.len > 0) {
+            if (!std.mem.lessThan(u8, opts.start_after, key)) continue; // strictly after
+        }
 
         if (opts.delimiter.len == 1 and opts.delimiter[0] == '/') {
             const suffix_start = opts.prefix.len;
@@ -404,4 +459,166 @@ pub fn listObjects(data_dir: Dir, allocator: Allocator, bucket: []const u8, opts
         .is_truncated = truncated,
         .next_continuation_token = next_token,
     };
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+/// Frees a fresh ObjectMeta returned directly by putObjectStreaming/copyObject
+/// (its `.alg`/`.sse_c_key_md5`/`.kms_key_id` are borrowed/literal, not
+/// allocator-owned — only the base64 wrap fields are).
+fn freeMeta(a: Allocator, meta: ObjectMeta) void {
+    a.free(meta.content_type);
+    a.free(meta.etag);
+    if (meta.encryption) |e| {
+        a.free(e.wrapped_dek_b64);
+        a.free(e.wrap_nonce_b64);
+    }
+}
+
+/// Frees an ObjectMeta obtained via internal.readMetadata (openObject/
+/// headObject), where every encryption sub-field is allocator-duped.
+fn freeReadMeta(a: Allocator, meta: ObjectMeta) void {
+    a.free(meta.content_type);
+    a.free(meta.etag);
+    if (meta.encryption) |e| {
+        a.free(e.alg);
+        a.free(e.wrapped_dek_b64);
+        a.free(e.wrap_nonce_b64);
+        a.free(e.sse_c_key_md5);
+        a.free(e.kms_key_id);
+    }
+}
+
+test "copyObject encrypted source to plaintext destination" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try buckets.createBucket(tmp.dir, "buk");
+
+    var master: [32]u8 = undefined;
+    std.crypto.random.bytes(&master);
+
+    const plaintext = "the quick brown fox jumps over the lazy dog" ** 50;
+    var pr = Io.Reader.fixed(plaintext);
+    const put_meta = try putObjectStreaming(tmp.dir, a, .{
+        .bucket = "buk",
+        .key = "src-enc",
+        .content_length = plaintext.len,
+        .master_key = &master,
+    }, &pr);
+    defer freeMeta(a, put_meta);
+
+    const copy_meta = try copyObject(tmp.dir, a, "buk", "src-enc", "buk", "dst-plain", null, .{
+        .src_unwrap_key = &master,
+    });
+    defer freeMeta(a, copy_meta);
+
+    try std.testing.expect(copy_meta.encryption == null);
+
+    var bd = try tmp.dir.openDir("buk", .{});
+    defer bd.close();
+    const got = try bd.readFileAlloc(a, "dst-plain", 1024 * 1024);
+    defer a.free(got);
+    try std.testing.expectEqualStrings(plaintext, got);
+}
+
+test "copyObject plaintext source to encrypted destination" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try buckets.createBucket(tmp.dir, "buk");
+
+    var master: [32]u8 = undefined;
+    std.crypto.random.bytes(&master);
+
+    const plaintext = "another round of copy testing, now going the other way." ** 30;
+    var pr = Io.Reader.fixed(plaintext);
+    const put_meta = try putObjectStreaming(tmp.dir, a, .{
+        .bucket = "buk",
+        .key = "src-plain",
+        .content_length = plaintext.len,
+    }, &pr);
+    defer freeMeta(a, put_meta);
+
+    const copy_meta = try copyObject(tmp.dir, a, "buk", "src-plain", "buk", "dst-enc", null, .{
+        .dst_wrap_key = &master,
+    });
+    defer freeMeta(a, copy_meta);
+
+    try std.testing.expect(copy_meta.encryption != null);
+    try std.testing.expectEqual(@as(u64, plaintext.len), copy_meta.size);
+
+    const opened = try openObject(tmp.dir, a, "buk", "dst-enc");
+    var file = opened.file;
+    defer file.close();
+    defer freeReadMeta(a, opened.meta);
+    const enc = opened.meta.encryption.?;
+
+    const wrapped_raw = try internal.decodeBase64(a, enc.wrapped_dek_b64);
+    defer a.free(wrapped_raw);
+    const nonce_raw = try internal.decodeBase64(a, enc.wrap_nonce_b64);
+    defer a.free(nonce_raw);
+    const dek = try sse.unwrapDek(&master, wrapped_raw[0..sse.wrapped_dek_len], nonce_raw[0..sse.nonce_size]);
+
+    var read_buf: [64 * 1024]u8 = undefined;
+    var fr = file.reader(&read_buf);
+    var dec_writer = Io.Writer.Allocating.init(a);
+    defer dec_writer.deinit();
+    try sse.decryptStream(&fr.interface, &dec_writer.writer, opened.meta.size, &dek);
+    try std.testing.expectEqualStrings(plaintext, dec_writer.written());
+}
+
+test "SSE-C put/get roundtrip via storage layer; wrong key fails unwrap" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try buckets.createBucket(tmp.dir, "buk");
+
+    var customer_key: [32]u8 = undefined;
+    std.crypto.random.bytes(&customer_key);
+    var md5_digest: [16]u8 = undefined;
+    Md5.hash(&customer_key, &md5_digest, .{});
+    const b64_enc = std.base64.standard.Encoder;
+    var md5_buf: [24]u8 = undefined;
+    const md5_b64 = b64_enc.encode(&md5_buf, &md5_digest);
+
+    const plaintext = "customer-managed key content, round and round." ** 20;
+    var pr = Io.Reader.fixed(plaintext);
+    const put_meta = try putObjectStreaming(tmp.dir, a, .{
+        .bucket = "buk",
+        .key = "ssec-obj",
+        .content_length = plaintext.len,
+        .master_key = &customer_key,
+        .sse_alg = "SSE-C",
+        .sse_c_key_md5 = md5_b64,
+    }, &pr);
+    defer freeMeta(a, put_meta);
+    try std.testing.expect(put_meta.encryption != null);
+    try std.testing.expectEqualStrings("SSE-C", put_meta.encryption.?.alg);
+
+    const opened = try openObject(tmp.dir, a, "buk", "ssec-obj");
+    var file = opened.file;
+    defer file.close();
+    defer freeReadMeta(a, opened.meta);
+    const enc = opened.meta.encryption.?;
+    try std.testing.expectEqualStrings(md5_b64, enc.sse_c_key_md5);
+
+    const wrapped_raw = try internal.decodeBase64(a, enc.wrapped_dek_b64);
+    defer a.free(wrapped_raw);
+    const nonce_raw = try internal.decodeBase64(a, enc.wrap_nonce_b64);
+    defer a.free(nonce_raw);
+
+    // Correct customer key decrypts fine.
+    const dek = try sse.unwrapDek(&customer_key, wrapped_raw[0..sse.wrapped_dek_len], nonce_raw[0..sse.nonce_size]);
+    var read_buf: [64 * 1024]u8 = undefined;
+    var fr = file.reader(&read_buf);
+    var dec_writer = Io.Writer.Allocating.init(a);
+    defer dec_writer.deinit();
+    try sse.decryptStream(&fr.interface, &dec_writer.writer, opened.meta.size, &dek);
+    try std.testing.expectEqualStrings(plaintext, dec_writer.written());
+
+    // Wrong key fails to unwrap the DEK.
+    var wrong_key: [32]u8 = undefined;
+    std.crypto.random.bytes(&wrong_key);
+    try std.testing.expectError(error.DecryptFailed, sse.unwrapDek(&wrong_key, wrapped_raw[0..sse.wrapped_dek_len], nonce_raw[0..sse.nonce_size]));
 }

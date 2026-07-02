@@ -9,6 +9,8 @@ const objects = @import("storage/objects.zig");
 const multipart = @import("storage/multipart.zig");
 const tagging = @import("storage/tagging.zig");
 const policy = @import("storage/policy.zig");
+const notification = @import("storage/notification.zig");
+const encryption_config_mod = @import("storage/encryption_config.zig");
 const lifecycle_mod = @import("storage/lifecycle.zig");
 const scrub_mod = @import("storage/scrub.zig");
 const versioning_mod = @import("storage/versioning.zig");
@@ -23,6 +25,7 @@ pub const ListOpts = types.ListOpts;
 pub const ListPage = types.ListPage;
 pub const PutInput = types.PutInput;
 pub const PartCopyRange = types.PartCopyRange;
+pub const CopyOpts = objects.CopyOpts;
 
 // ── Bucket ops ───────────────────────────────────────────────────────────────
 pub const createBucket = buckets.createBucket;
@@ -56,6 +59,17 @@ pub const deleteObjectTagging = tagging.deleteObjectTagging;
 pub const putBucketPolicy = policy.putBucketPolicy;
 pub const getBucketPolicy = policy.getBucketPolicy;
 pub const deleteBucketPolicy = policy.deleteBucketPolicy;
+
+// ── Bucket event notifications ──────────────────────────────────────────────
+pub const putBucketNotification = notification.putBucketNotification;
+pub const getBucketNotification = notification.getBucketNotification;
+
+// ── Bucket default encryption ───────────────────────────────────────────────
+pub const EncryptionAlg = encryption_config_mod.Alg;
+pub const putBucketEncryption = encryption_config_mod.putBucketEncryption;
+pub const getBucketEncryption = encryption_config_mod.getBucketEncryption;
+pub const deleteBucketEncryption = encryption_config_mod.deleteBucketEncryption;
+pub const defaultEncryptionAlgorithm = encryption_config_mod.defaultAlgorithm;
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 pub const putBucketLifecycle = lifecycle_mod.putBucketLifecycle;
@@ -99,10 +113,14 @@ test {
     const std = @import("std");
     std.testing.refAllDecls(@import("storage/internal.zig"));
     std.testing.refAllDecls(buckets);
+    std.testing.refAllDecls(notification);
     std.testing.refAllDecls(@import("storage/sse.zig"));
     std.testing.refAllDecls(lifecycle_mod);
     std.testing.refAllDecls(scrub_mod);
     std.testing.refAllDecls(versioning_mod);
     std.testing.refAllDecls(object_lock_mod);
     std.testing.refAllDecls(object_lock_config_mod);
+    std.testing.refAllDecls(objects);
+    std.testing.refAllDecls(multipart);
+    std.testing.refAllDecls(@import("storage/encryption_config.zig"));
 }

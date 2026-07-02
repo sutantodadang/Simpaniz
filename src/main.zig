@@ -4,6 +4,10 @@ const Config = @import("config.zig");
 const server = @import("server.zig");
 const metrics = @import("metrics.zig");
 const bootstrap = @import("bootstrap.zig");
+const iam = @import("iam.zig");
+const events = @import("events.zig");
+const tls_server = @import("tls_server.zig");
+const index_mod = @import("index.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -17,15 +21,16 @@ pub fn main() !void {
 
     std.log.info("Simpaniz v0.1.1 starting (data={s}, region={s})", .{ config.data_dir, config.region });
 
+    var tls_ctx: ?*tls_server.ServerContext = null;
     if (config.tls_cert_path.len > 0 or config.tls_key_path.len > 0) {
-        std.log.err(
-            \\SIMPANIZ_TLS_CERT/SIMPANIZ_TLS_KEY are set, but in-process TLS is not yet
-            \\implemented. Terminate HTTPS at a reverse proxy (nginx, caddy, haproxy)
-            \\and forward plaintext HTTP to Simpaniz. See SECURITY.md for an example.
-            \\Refusing to start so you do not accidentally serve plaintext.
-        , .{});
-        return error.TlsNotImplemented;
+        if (config.tls_cert_path.len == 0 or config.tls_key_path.len == 0) {
+            std.log.err("Set BOTH SIMPANIZ_TLS_CERT and SIMPANIZ_TLS_KEY (or neither).", .{});
+            return error.TlsConfigIncomplete;
+        }
+        tls_ctx = try tls_server.ServerContext.load(gpa, config.tls_cert_path, config.tls_key_path);
+        std.log.info("TLS enabled (in-process TLS 1.3): cert={s}", .{config.tls_cert_path});
     }
+    defer if (tls_ctx) |t| t.deinit();
 
     var data_dir = blk: {
         if (std.fs.path.isAbsolute(config.data_dir)) {
@@ -45,6 +50,10 @@ pub fn main() !void {
     // env vars, mirroring the MinIO root-user UX so the web console works
     // out of the box.
     try bootstrap.ensureCredentials(&config, data_dir);
+
+    var iam_store = iam.load(gpa, data_dir);
+    defer iam_store.deinit();
+    std.log.info("IAM: {d} user(s) loaded", .{iam_store.users.len});
 
     var registry = metrics.Registry{ .started_unix = std.time.timestamp() };
 
@@ -68,6 +77,22 @@ pub fn main() !void {
     }
     defer if (cluster_rt) |rt| rt.deinit();
 
+    // Event notifications — only wired up when a webhook target is configured.
+    const notify_url = std.process.getEnvVarOwned(gpa, "SIMPANIZ_NOTIFY_WEBHOOK") catch null;
+    defer if (notify_url) |u| gpa.free(u);
+    var notifier: ?*events.Notifier = null;
+    if (notify_url) |u| {
+        notifier = try events.Notifier.init(gpa, u, config.region, data_dir);
+        try notifier.?.start();
+        std.log.info("event notifications enabled: webhook={s}", .{u});
+    }
+    defer if (notifier) |n| n.deinit();
+
+    // Persistent object-listing index — single-node only (cluster mode keeps
+    // using the FS-walk listing since shards aren't locally enumerable).
+    var index_mgr = index_mod.Manager.init(gpa, data_dir);
+    defer index_mgr.deinit();
+
     server.installSignalHandlers();
     try server.start(.{
         .config = &config,
@@ -75,6 +100,10 @@ pub fn main() !void {
         .gpa = gpa,
         .registry = &registry,
         .cluster = cluster_rt,
+        .iam = &iam_store,
+        .notifier = notifier,
+        .tls = tls_ctx,
+        .index = if (cluster_rt == null) &index_mgr else null,
     });
 }
 
@@ -89,4 +118,8 @@ test {
     _ = @import("handlers.zig");
     _ = @import("router.zig");
     _ = @import("cluster.zig");
+    _ = @import("iam.zig");
+    _ = @import("events.zig");
+    _ = @import("tls_server.zig");
+    _ = @import("index.zig");
 }

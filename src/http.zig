@@ -102,6 +102,20 @@ pub const Body = union(enum) {
     bytes: []const u8,
     file: FileSlice,
     encrypted_file: EncryptedFile,
+    /// Streamed body produced by a caller-supplied callback (used by the
+    /// cluster GET path so an erasure-coded object never has to be
+    /// buffered whole — see `cluster/orchestrator.zig`'s
+    /// `getRangeStreaming`). `http.zig` stays cluster-agnostic: the
+    /// callback indirection is the only coupling.
+    ec_stream: EcStream,
+
+    pub const EcStream = struct {
+        ctx: *anyopaque,
+        stream_fn: *const fn (ctx: *anyopaque, writer: *Io.Writer) anyerror!void,
+        /// Exact number of bytes `stream_fn` will write (drives
+        /// Content-Length).
+        length: u64,
+    };
 
     pub const FileSlice = struct {
         file: File,
@@ -113,11 +127,17 @@ pub const Body = union(enum) {
 
     pub const EncryptedFile = struct {
         file: File,
-        /// Plaintext length to emit (Content-Length).
+        /// Total plaintext size of the object (used to size/validate chunk
+        /// decryption; NOT necessarily the number of bytes emitted).
         plaintext_length: u64,
         /// 32-byte data-encryption key (already unwrapped).
         dek: [32]u8,
         owns_file: bool,
+        /// Plaintext byte offset to start emitting from (Range support).
+        offset: u64 = 0,
+        /// Plaintext bytes to emit. For a full GET this equals
+        /// `plaintext_length`.
+        length: u64 = 0,
     };
 
     pub fn length(self: Body) u64 {
@@ -125,7 +145,8 @@ pub const Body = union(enum) {
             .none => 0,
             .bytes => |b| b.len,
             .file => |f| f.length,
-            .encrypted_file => |e| e.plaintext_length,
+            .encrypted_file => |e| e.length,
+            .ec_stream => |e| e.length,
         };
     }
 };
@@ -299,8 +320,13 @@ pub fn writeResponse(writer: *Io.Writer, resp: *const Response, head_only: bool)
             try ef.file.seekTo(0);
             var buf: [64 * 1024]u8 = undefined;
             var fr = ef.file.reader(&buf);
-            try sse.decryptStream(&fr.interface, writer, ef.plaintext_length, &ef.dek);
+            if (ef.offset == 0 and ef.length == ef.plaintext_length) {
+                try sse.decryptStream(&fr.interface, writer, ef.plaintext_length, &ef.dek);
+            } else {
+                try sse.decryptRange(&fr.interface, writer, &ef.dek, ef.plaintext_length, ef.offset, ef.length);
+            }
         },
+        .ec_stream => |e| try e.stream_fn(e.ctx, writer),
     }
 }
 
