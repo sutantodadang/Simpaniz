@@ -20,7 +20,12 @@ pub const Counter = struct {
     }
 };
 
-const latency_buckets_ms = [_]f64{ 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000 };
+/// Upper bound (inclusive) of each latency histogram bucket, in ms. The
+/// histogram itself carries one more bucket than this array (the `+Inf`
+/// overflow catch-all) — see `Histogram.buckets`. Exported so
+/// `timeseries.zig` can compute windowed percentiles from bucket-count
+/// deltas without duplicating the edge list.
+pub const latency_buckets_ms = [_]f64{ 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000 };
 
 pub const Histogram = struct {
     buckets: [latency_buckets_ms.len + 1]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),

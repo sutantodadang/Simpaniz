@@ -19,6 +19,8 @@ const storage_paths = @import("storage/paths.zig");
 const iam = @import("iam.zig");
 const sts_mod = @import("sts.zig");
 const Config = @import("config.zig");
+const metrics = @import("metrics.zig");
+const timeseries = @import("timeseries.zig");
 
 pub const HandlerContext = struct {
     data_dir: std.fs.Dir,
@@ -56,6 +58,14 @@ pub const HandlerContext = struct {
     /// Process start time (unix seconds), mirrors `metrics.Registry.started_unix`
     /// — used by `/_admin/info` for uptime. 0 in tests.
     started_unix: i64 = 0,
+    /// Metrics registry — used by `/_dashboard/api/summary` for live gauge
+    /// and counter values. Null only in handler unit tests that don't
+    /// exercise dashboard routes.
+    registry: ?*metrics.Registry = null,
+    /// In-process metric history sampler, or null when the sampler is
+    /// disabled (`SIMPANIZ_METRICS_SAMPLE_S=0`) — `/_dashboard/api/series`
+    /// then returns an empty point list.
+    tseries: ?*timeseries.Store = null,
 };
 
 // ── STS (root POST dispatch: Action=AssumeRole[WithWebIdentity]) ────────────

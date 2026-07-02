@@ -8,6 +8,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const handlers = @import("handlers.zig");
 const admin = @import("admin.zig");
+const dashboard = @import("dashboard.zig");
 
 pub const Routed = struct {
     response: http.Response,
@@ -24,6 +25,12 @@ pub fn route(req: *http.Request, ctx: handlers.HandlerContext) http.Response {
     // auth check inside (see admin.zig); dispatched before bucket routing
     // since it has no bucket/key component.
     if (std.mem.startsWith(u8, req.path, "/_admin/")) return admin.handle(ctx, req);
+
+    // Dashboard REST API — read-only telemetry for the console's Metrics
+    // tab (see dashboard.zig). Any authenticated principal, not root-only;
+    // dispatched before bucket routing like /_admin/ since it has no
+    // bucket/key component.
+    if (std.mem.startsWith(u8, req.path, "/_dashboard/")) return dashboard.handle(ctx, req);
 
     // CORS preflight.
     if (req.method == .OPTIONS) {

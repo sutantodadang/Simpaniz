@@ -81,6 +81,19 @@ src/
                     separate `mc`-style tool).
   s3_client.zig     Minimal SigV4-signing HTTP client shared by
                     `admin_cli.zig` and `tiering.zig`'s remote mode.
+  ui.zig            Embedded web console: serves `/console/*` static assets
+                    (HTML/CSS/JS, `ui_assets/`) ahead of SigV4 enforcement;
+                    the console's own S3/dashboard calls are signed
+                    in-browser and go through normal auth.
+  timeseries.zig    In-process 24h metric history: background sampler
+                    (`SIMPANIZ_METRICS_SAMPLE_S`, default 10s) snapshots
+                    `metrics.Registry` into an 8640-point ring; derives
+                    per-second rates and p50/p95/p99 latency from
+                    histogram-bucket deltas. In-memory only.
+  dashboard.zig     Read-only `/_dashboard/api/{summary,series}` REST,
+                    SigV4-authenticated, backed by `metrics.zig` +
+                    `timeseries.zig`. Powers the console's Metrics tab —
+                    single-binary alternative to Prometheus/Grafana.
 ```
 
 ## Request lifecycle

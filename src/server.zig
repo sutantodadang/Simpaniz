@@ -21,6 +21,7 @@ const tls_server = @import("tls_server.zig");
 const index_mod = @import("index.zig");
 const tiering_mod = @import("tiering.zig");
 const sts = @import("sts.zig");
+const timeseries = @import("timeseries.zig");
 
 const DaemonCtx = struct {
     data_dir: std.fs.Dir,
@@ -183,6 +184,9 @@ pub const Context = struct {
     sts: *sts.StsStore,
     /// OIDC config for AssumeRoleWithWebIdentity.
     oidc: *sts.OidcConfig,
+    /// In-process metric history sampler for the dashboard's Metrics tab,
+    /// or null when disabled (`SIMPANIZ_METRICS_SAMPLE_S=0`).
+    tseries: ?*timeseries.Store = null,
 };
 
 pub fn requestShutdown() void {
@@ -477,6 +481,8 @@ fn serveHttp(in: *Io.Reader, out: *Io.Writer, ctx: Context) void {
             .iam = ctx.iam,
             .config = ctx.config,
             .started_unix = ctx.registry.started_unix,
+            .registry = ctx.registry,
+            .tseries = ctx.tseries,
         };
 
         // Special: /metrics (needs registry).
@@ -601,7 +607,11 @@ fn isExemptPath(path: []const u8) bool {
         // Admin API does its own root-only check (see admin.zig); it isn't
         // an S3 bucket/key operation so the generic bucket-policy mapping
         // doesn't apply. SigV4 auth (above) still runs unconditionally.
-        std.mem.startsWith(u8, path, "/_admin/");
+        std.mem.startsWith(u8, path, "/_admin/") or
+        // Dashboard API does its own auth check (see dashboard.zig); same
+        // reasoning as /_admin/ — no bucket/key component to map a policy
+        // onto, and SigV4 auth (above) still runs unconditionally.
+        std.mem.startsWith(u8, path, "/_dashboard/");
 }
 
 /// True for the STS dispatch endpoint: `POST /` with an `Action=` query

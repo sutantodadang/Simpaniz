@@ -91,6 +91,7 @@ Status legend:
 | `/healthz`                                 |   ✅   | Liveness — server is up.                                  |
 | `/readyz`                                  |   ✅   | Readiness — data dir writable.                            |
 | `/metrics`                                 |   ✅   | Prometheus text-exposition format.                        |
+| `/console/` + `/_dashboard/api/{summary,series}` | ✅ | Built-in web console Metrics tab: canvas charts (req/err rate, latency percentiles, throughput, in-flight), summary cards, cluster node states. SigV4-authenticated, in-process 24h history (`SIMPANIZ_METRICS_SAMPLE_S`), no Prometheus/Grafana needed. |
 | Structured JSON access log                 |   ✅   | One line per request.                                     |
 | `x-amz-request-id` header                  |   ✅   | Per-request 32-hex-char id.                               |
 

@@ -114,6 +114,7 @@ All configuration is via environment variables.
 | `SIMPANIZ_OIDC_AUDIENCE`     | *(empty)*      | Optional OIDC `aud` claim to enforce. |
 | `SIMPANIZ_OIDC_DEFAULT_POLICY` | *(empty)*    | Optional named policy file (under `.simpaniz-iam/policies/`) applied when the JWT carries no policy claim. |
 | `SIMPANIZ_ADMIN_ENDPOINT`    | `http://127.0.0.1:9000` | Endpoint the `simpaniz admin` CLI targets. |
+| `SIMPANIZ_METRICS_SAMPLE_S`  | `10`           | Background sampler period (seconds) for the in-process 24h metric history that powers the console's Metrics tab. `0` disables the sampler; `/_dashboard/api/*` still answers, `/summary` from live counters, `/series` with no points. |
 
 ## Endpoints
 
@@ -131,6 +132,8 @@ matrix. Most clients (`curl`, `aws s3`, `boto3`, `aws-sdk-go`,
 | `/readyz`   | GET    | Readiness — data directory writable.               |
 | `/metrics`  | GET    | Prometheus exposition format.                      |
 | `/console/` | GET    | Embedded web console (single-page admin UI).       |
+| `/_dashboard/api/summary` | GET | SigV4-authenticated JSON: uptime, totals, latency percentiles, mode, TLS, IAM users, tiering, cluster states. Powers the console's Metrics tab. |
+| `/_dashboard/api/series`  | GET | SigV4-authenticated JSON time series (`?window=60..86400` seconds) from the in-process 24h metric history. |
 
 ### Web console
 
@@ -154,6 +157,19 @@ talks to the existing S3 API. SigV4 is computed in the browser via Web
 Crypto, so every action is authenticated the same way as a `curl` or
 `aws s3` call. Credentials are kept in `sessionStorage` and never sent
 anywhere except as part of the S3 signature.
+
+#### Metrics dashboard
+
+The console's **Metrics** tab is a built-in, single-binary alternative to a
+Prometheus + Grafana stack — no external scraper or dashboard service
+required. It draws dependency-free canvas line charts (requests/errors per
+second, latency p50/p95/p99, throughput, in-flight requests), summary cards,
+and cluster node-state dots, over 15m/1h/6h/24h windows with a 10s
+auto-refresh. Data comes from an in-process 24h ring buffer (sampled every
+`SIMPANIZ_METRICS_SAMPLE_S` seconds, default 10; in-memory only, cleared on
+restart) served by the SigV4-authenticated `/_dashboard/api/*` endpoints
+above. The plain-text `/metrics` Prometheus endpoint is unaffected and still
+available for external scraping.
 
 ## Admin CLI
 

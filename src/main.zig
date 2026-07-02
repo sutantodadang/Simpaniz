@@ -11,6 +11,7 @@ const index_mod = @import("index.zig");
 const tiering_mod = @import("tiering.zig");
 const sts = @import("sts.zig");
 const admin_cli = @import("admin_cli.zig");
+const timeseries = @import("timeseries.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -122,6 +123,21 @@ pub fn main() !void {
         .remote => std.log.info("tiering enabled: mode=remote url={s} bucket={s}", .{ tiering_ctx.url, tiering_ctx.tier_bucket }),
     }
 
+    // In-process metric history for the console's Metrics dashboard — an
+    // in-memory ring, no Prometheus/Grafana required. Disabled entirely
+    // when SIMPANIZ_METRICS_SAMPLE_S=0 (dashboard API still answers:
+    // /summary from live registry counters, /series with an empty list).
+    const metrics_sample_s = timeseries.readSampleIntervalEnv(gpa);
+    var tseries_store: ?*timeseries.Store = null;
+    if (metrics_sample_s > 0) {
+        tseries_store = try timeseries.Store.init(gpa, &registry, timeseries.default_capacity, metrics_sample_s);
+        try tseries_store.?.start();
+        std.log.info("metrics dashboard: sampling every {d}s (24h ring)", .{metrics_sample_s});
+    } else {
+        std.log.info("metrics dashboard: sampler disabled (SIMPANIZ_METRICS_SAMPLE_S=0)", .{});
+    }
+    defer if (tseries_store) |ts| ts.deinit();
+
     server.installSignalHandlers();
     try server.start(.{
         .config = &config,
@@ -136,6 +152,7 @@ pub fn main() !void {
         .tiering = &tiering_ctx,
         .sts = &sts_store,
         .oidc = &oidc_config,
+        .tseries = tseries_store,
     });
 }
 
@@ -159,4 +176,6 @@ test {
     _ = @import("admin.zig");
     _ = @import("admin_cli.zig");
     _ = @import("s3_client.zig");
+    _ = @import("timeseries.zig");
+    _ = @import("dashboard.zig");
 }

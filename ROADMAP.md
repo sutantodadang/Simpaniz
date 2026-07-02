@@ -193,13 +193,32 @@ Don't out-feature MinIO on its turf — win where it's heavy or weak.
 1. **Footprint** — keep single static ~3.4 MB binary, zero runtime deps, vs
    MinIO ~100 MB. Lean into edge / IoT / embedded / air-gapped self-host.
    Guard rule: every new feature must justify any new dependency or stay stdlib.
+   Still holding after the P4 dashboard bet — no new deps added (dashboard.js
+   is vanilla canvas/JS, embedded like the rest of the console).
 2. **Zero-config TLS** — ACME auto-cert (1.2 stretch). MinIO needs manual setup.
 3. **One binary = server + client + admin** — no separate `mc`.
-4. **Pick ONE deep bet (don't build all):**
-   - WASM/Lua server-side object transform filters (on-PUT/on-GET hooks).
-   - Native sync active-active replication w/ version-vector conflict
-     resolution — MinIO's active-active is operationally fiddly.
-   - Built-in single-binary metrics+UI dashboard beyond Prometheus scrape.
+4. **Deep bet — CHOSEN: built-in single-binary metrics+UI dashboard ❌→✅ DONE.**
+   Per the "pick ONE" rule, the other two candidates were **not built**:
+   WASM/Lua on-PUT/on-GET transform filters, and native sync active-active
+   replication w/ version-vector conflict resolution. Both remain open if a
+   future deep bet is warranted.
+   - **New:** `src/timeseries.zig` — in-process 24h metric history.
+     Background sampler (`SIMPANIZ_METRICS_SAMPLE_S`, default 10s, `0`
+     disables) snapshots `metrics.Registry` into an 8640-point ring;
+     per-second rates and p50/p95/p99 latency derived server-side from
+     histogram-bucket deltas (Prometheus-style interpolation). In-memory
+     only — restart clears history.
+   - **New:** `src/dashboard.zig` — SigV4-authenticated read-only API:
+     `GET /_dashboard/api/summary` (uptime, totals, percentiles, mode, TLS,
+     IAM users, tiering, cluster membership states) and
+     `GET /_dashboard/api/series?window=60..86400`.
+   - Console gained a **Metrics tab** (`src/ui_assets/dashboard.js`):
+     dependency-free canvas line charts (requests/errors per s, latency
+     percentiles, throughput, in-flight), summary cards, cluster node-state
+     dots; 15m/1h/6h/24h windows, 10s auto-refresh; reuses the console's
+     browser-side SigV4 signer.
+   - **Accept:** open `/console/`, Metrics tab renders live charts with no
+     Prometheus/Grafana running. Verified live.
 
 ---
 
@@ -226,7 +245,11 @@ P1.4 Evt ─┘
   completeness (NoncurrentVersionExpiration/tag filters/transitions),
   tiering, STS/OIDC identity, and admin API + CLI all shipped (~175 tests
   green, live smoke-tested).
-- **P4:** commit to exactly one deep bet. Breadth here loses to MinIO; depth wins.
+- **P4 is done** — deep bet chosen and shipped: built-in single-binary
+  metrics+UI dashboard (`timeseries.zig`, `dashboard.zig`, console Metrics
+  tab). The other two candidate bets (WASM/Lua transform filters, sync
+  active-active replication) were intentionally not built, per "pick ONE."
+  Footprint/one-binary properties still hold.
 
 ## Anti-goals
 
