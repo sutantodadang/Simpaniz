@@ -15,18 +15,18 @@ Status legend: ✅ done · ⚠️ partial · ❌ missing
 
 | Area | MinIO | Simpaniz now | Gap |
 |---|---|---|---|
-| IAM / policy | Multi-user, PBAC enforced, STS, groups | multi-user store + policy **enforced** (`iam.zig`), explicit-deny-wins evaluation | STS, groups |
-| Identity | OIDC, LDAP, AssumeRole | SigV4 only | external IdP |
+| IAM / policy | Multi-user, PBAC enforced, STS, groups | multi-user store + policy **enforced** (`iam.zig`) + STS (`sts.zig`) | groups |
+| Identity | OIDC, LDAP, AssumeRole | AssumeRole + AssumeRoleWithWebIdentity (OIDC, ES256+RS256) (`sts.zig`) | LDAP |
 | Encryption | SSE-S3/KMS/C complete, KES | SSE-S3/C/KMS(local keyring) complete: multipart, copy, range, default-bucket (`sse.zig`) | external KMS/KES |
 | TLS | in-process | in-process TLS 1.3 (`tls_server.zig`) | ACME auto-cert (stretch) |
 | Cluster | erasure sets, rebalance, dist. locks | SWIM-lite membership (probe/gossip/join) + HRW rebalance daemon (`membership.zig`, `rebalance.zig`) | dist. locks, decommission |
 | Listing | metadata layer | per-bucket LSM-lite index (`index.zig`), FS-walk fallback | none (single-node only; cluster still FS-walk) |
 | Events | webhook/Kafka/NATS/AMQP/MQTT | webhook (`events.zig`) | Kafka/NATS/AMQP/MQTT targets |
 | Replication | active-active, sync | async best-effort (`replication.zig`) | sync + bidirectional |
-| Tiering | hot→cold (S3/GCS/Azure) | none | lifecycle transitions |
-| Admin | `mc admin`, admin API | console UI only (`ui.zig`) | admin API + CLI |
-| Versioning | full | ⚠️ suspended-overwrite TODO | completeness |
-| Object Lock | full WORM | ⚠️ no bucket-default retention | completeness |
+| Tiering | hot→cold (S3/GCS/Azure) | lifecycle `<Transition>` → local cold dir or remote S3-compatible target, transparent GET (`tiering.zig`) | native GCS/Azure backends |
+| Admin | `mc admin`, admin API | admin REST + one-binary CLI, user/policy CRUD, cluster, config (`admin.zig`, `admin_cli.zig`) | none — parity |
+| Versioning | full | ✅ suspended-null semantics, `?versionId=null`, IsLatest ordering, `x-amz-version-id` on PUT (`versioning.zig`) | none |
+| Object Lock | full WORM | ✅ bucket-default retention applied on PUT (`object_lock_config.zig`, `handlers.applyDefaultRetention`) | none |
 
 ---
 
@@ -129,34 +129,60 @@ These four block real multi-tenant use. Highest priority. **All four DONE**
 
 ## Phase 3 — Feature parity completion
 
-### 3.1 Versioning completeness ⚠️→✅
-- `storage/versioning.zig`: suspended-versioning overwrite semantics (null
-  version id), noncurrent version ordering for lifecycle.
+All six DONE (~175 tests green, live smoke-tested).
 
-### 3.2 Lifecycle completeness ⚠️→✅
-- `storage/lifecycle.zig`: `<NoncurrentVersionExpiration>`, tag filters,
-  **transitions** (links to 3.4 tiering).
+### 3.1 Versioning completeness ⚠️→✅ DONE
+- `storage/versioning.zig`: suspended-versioning null-version semantics
+  (overwrite-in-place of the null version, null delete markers),
+  `?versionId=null` addressing, correct IsLatest/newest-first ordering (live
+  object pinned), `x-amz-version-id` on PUT, noncurrent-since timestamps for
+  lifecycle.
 
-### 3.3 Object Lock completeness ⚠️→✅
-- `storage/object_lock_config.zig`: bucket-level default retention storage +
-  application on PUT.
+### 3.2 Lifecycle completeness ⚠️→✅ DONE
+- `storage/lifecycle.zig`: `<NoncurrentVersionExpiration>` (expires
+  noncurrent versions N days after becoming noncurrent), `<Filter>` tag
+  filters (single `<Tag>`, incl. inside `<And>`), `<Transition>`
+  (Days + StorageClass) driving tiering (links to 3.4); per-sub-block Days
+  parsing fix.
 
-### 3.4 Tiering ❌→✅
-- **New:** `src/tiering.zig`. Lifecycle `<Transition>` → move cold objects to a
-  remote S3/local-cold target, leave a stub; transparent fetch on GET.
-- **Accept:** object older than N days transitions; GET still returns it (pulled
-  from cold).
+### 3.3 Object Lock completeness ⚠️→✅ DONE
+- `storage/object_lock_config.zig` + `handlers.applyDefaultRetention`:
+  bucket-level default retention storage, applied to every PUT.
 
-### 3.5 STS / external identity ❌→✅
-- **Files:** `auth.zig`, new `src/sts.zig`.
-- `AssumeRole`, then OIDC (`AssumeRoleWithWebIdentity`). LDAP optional/later.
+### 3.4 Tiering ❌→✅ DONE
+- **New:** `src/tiering.zig`. Lifecycle `<Transition>` moves cold objects to
+  `SIMPANIZ_TIER_DIR` (local cold dir) or a SigV4-signed remote
+  S3-compatible target (`SIMPANIZ_TIER_URL`/`SIMPANIZ_TIER_BUCKET`/
+  `SIMPANIZ_TIER_ACCESS_KEY`/`SIMPANIZ_TIER_SECRET_KEY`/`SIMPANIZ_TIER_REGION`);
+  local file becomes a stub. GET transparently fetches from cold (spooled to
+  a temp file). `x-amz-storage-class` header echoed. SSE composes — cold
+  storage holds the same on-disk (encrypted) bytes.
+- **Accept:** object older than N days transitions; GET still returns it
+  (pulled from cold).
+
+### 3.5 STS / external identity ❌→✅ DONE
+- **New:** `src/sts.zig`.
+- `AssumeRole` (SigV4-signed, temp creds with optional session `Policy`,
+  900–43200 s) and `AssumeRoleWithWebIdentity` (unsigned, OIDC JWT: ES256
+  fully verified, RS256 verified via bigint modexp; JWKS fetched from
+  `SIMPANIZ_OIDC_JWKS_URL`, issuer `SIMPANIZ_OIDC_ISSUER`, optional
+  `SIMPANIZ_OIDC_AUDIENCE`, policy claim → named policy files under
+  `.simpaniz-iam/policies/`, default `SIMPANIZ_OIDC_DEFAULT_POLICY`). Session
+  tokens via `x-amz-security-token`; session policy intersects base
+  permissions (gates root too). Query-param API only (no form body parsing).
+  Creds in-memory — restart invalidates. LDAP optional/later.
 - **Accept:** OIDC token → temp creds → scoped S3 access.
 
-### 3.6 Admin API + CLI parity ⚠️→✅
-- **New:** `src/admin.zig` (admin REST), extend `ui.zig`.
-- Admin endpoints: user/policy CRUD, cluster info, healing status, config.
-- **Differentiator:** ship server + client in **one binary** (`simpaniz admin …`
-  subcommand) — MinIO needs separate `mc`. Build-flag in `build.zig`.
+### 3.6 Admin API + CLI parity ⚠️→✅ DONE
+- **New:** `src/admin.zig` (admin REST), `src/admin_cli.zig` +
+  `src/s3_client.zig` (CLI client, same binary).
+- Root-only REST under `/_admin/`: info, users CRUD, policies CRUD, cluster,
+  sanitized config (never returns secrets). IAM users are now hot-editable
+  (mutex + persisted `users.json`).
+- **Differentiator:** ship server + client in **one binary**
+  (`simpaniz admin …` subcommand, SigV4-signed via
+  `SIMPANIZ_ADMIN_ENDPOINT`/`SIMPANIZ_ACCESS_KEY`/`SIMPANIZ_SECRET_KEY`) —
+  MinIO needs a separate `mc`.
 
 ---
 
@@ -196,6 +222,10 @@ P1.4 Evt ─┘
   multi-tenant" claim now holds; ACME auto-cert remains a P4 stretch item.
 - **P2 is done** — metadata index layer, streaming EC, and cluster
   membership + rebalance all shipped (141 tests green, benchmarked).
+- **P3 is done** — versioning suspended-null semantics, lifecycle
+  completeness (NoncurrentVersionExpiration/tag filters/transitions),
+  tiering, STS/OIDC identity, and admin API + CLI all shipped (~175 tests
+  green, live smoke-tested).
 - **P4:** commit to exactly one deep bet. Breadth here loses to MinIO; depth wins.
 
 ## Anti-goals

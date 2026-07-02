@@ -92,6 +92,11 @@ pub const readObjectVersionMeta = versioning_mod.readVersionMeta;
 pub const addDeleteMarker = versioning_mod.addDeleteMarker;
 pub const listObjectVersions = versioning_mod.listVersions;
 pub const VersionEntry = versioning_mod.VersionEntry;
+pub const newVersionId = versioning_mod.newVersionId;
+pub const currentVersionId = versioning_mod.currentVersionId;
+pub const setCurrentVersionId = versioning_mod.setCurrentVersionId;
+pub const deleteCurrentVersionIdSidecar = versioning_mod.deleteCurrentVersionIdSidecar;
+pub const setNullDeleteMarker = versioning_mod.setNullDeleteMarker;
 
 // ── Object Lock ──────────────────────────────────────────────────────────────
 pub const RetentionMode = object_lock_mod.Mode;

@@ -13,6 +13,10 @@ const http = @import("http.zig");
 pub const Principal = struct {
     access_key: []const u8,
     is_root: bool,
+    /// Set only for STS temp-credential sessions: a session policy JSON
+    /// document that further restricts (never expands) what the base
+    /// principal (root or IAM user) can do. See `authorize` below.
+    session_policy: ?[]const u8 = null,
 };
 
 pub const Decision = enum { allow, deny, none };
@@ -28,17 +32,147 @@ pub const User = struct {
 pub const Store = struct {
     arena: std.heap.ArenaAllocator,
     users: []User,
+    /// Guards `users` (both the slice header — ptr/len can change on
+    /// upsert/remove — and in-place field mutation on update). The store is
+    /// loaded once at startup and, before the admin API, was never mutated
+    /// after that; `upsertUser`/`removeUser` make it mutable at runtime, so
+    /// concurrent `findUser` reads need a lock. `findUser` takes `*const
+    /// Store` for API compatibility with existing callers, so it reaches
+    /// the mutex via `@constCast` — sound here because every real Store
+    /// instance is a mutable value (never `const`); only the pointer type
+    /// at the call site is const.
+    mutex: std.Thread.Mutex = .{},
 
     pub fn deinit(self: *Store) void {
         self.arena.deinit();
     }
 
     pub fn findUser(self: *const Store, access_key: []const u8) ?*const User {
+        const mut_self: *Store = @constCast(self);
+        mut_self.mutex.lock();
+        defer mut_self.mutex.unlock();
         for (self.users, 0..) |u, i| {
             if (!u.enabled) continue;
             if (std.mem.eql(u8, u.access_key, access_key)) return &self.users[i];
         }
         return null;
+    }
+
+    /// Insert a new user or replace an existing one (matched by
+    /// access_key), then persist to disk. `secret_key` and `access_key` are
+    /// duped into the store's arena; `policy_json`, if given, is parsed and
+    /// its Value tree also lives in the arena.
+    pub fn upsertUser(
+        self: *Store,
+        data_dir: std.fs.Dir,
+        access_key: []const u8,
+        secret_key: []const u8,
+        policy_json: ?[]const u8,
+        enabled: bool,
+    ) !void {
+        const a = self.arena.allocator();
+        const ak = try a.dupe(u8, access_key);
+        const sk = try a.dupe(u8, secret_key);
+        var policy_val: ?std.json.Value = null;
+        if (policy_json) |pj| {
+            policy_val = try std.json.parseFromSliceLeaky(std.json.Value, a, pj, .{});
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.users, 0..) |u, i| {
+            if (std.mem.eql(u8, u.access_key, ak)) {
+                self.users[i] = .{ .access_key = ak, .secret_key = sk, .enabled = enabled, .policy = policy_val };
+                try self.persistLocked(data_dir);
+                return;
+            }
+        }
+
+        const new_users = try a.alloc(User, self.users.len + 1);
+        @memcpy(new_users[0..self.users.len], self.users);
+        new_users[self.users.len] = .{ .access_key = ak, .secret_key = sk, .enabled = enabled, .policy = policy_val };
+        self.users = new_users;
+        try self.persistLocked(data_dir);
+    }
+
+    /// Remove a user by access_key and persist. Returns true if a user was
+    /// found and removed, false if no such user existed (no-op, no write).
+    pub fn removeUser(self: *Store, data_dir: std.fs.Dir, access_key: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const idx = for (self.users, 0..) |u, i| {
+            if (std.mem.eql(u8, u.access_key, access_key)) break i;
+        } else return false;
+
+        const a = self.arena.allocator();
+        const new_users = try a.alloc(User, self.users.len - 1);
+        @memcpy(new_users[0..idx], self.users[0..idx]);
+        @memcpy(new_users[idx..], self.users[idx + 1 ..]);
+        self.users = new_users;
+        try self.persistLocked(data_dir);
+        return true;
+    }
+
+    /// Serialize `users.json` in the same shape `load` reads (includes
+    /// secret_key — this is the on-disk credential store; see
+    /// `listUsersJson` for the secret-free API view). Writes via
+    /// tmp-file + rename for crash-atomicity, mode 0600. Caller must hold
+    /// `mutex`.
+    fn persistLocked(self: *Store, data_dir: std.fs.Dir) !void {
+        var iam_dir = try data_dir.makeOpenPath(IAM_DIR, .{});
+        defer iam_dir.close();
+
+        var scratch = std.heap.ArenaAllocator.init(self.arena.child_allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        var users_arr = std.json.Array.init(sa);
+        for (self.users) |u| {
+            var obj = std.json.ObjectMap.init(sa);
+            try obj.put("access_key", .{ .string = u.access_key });
+            try obj.put("secret_key", .{ .string = u.secret_key });
+            try obj.put("enabled", .{ .bool = u.enabled });
+            if (u.policy) |p| try obj.put("policy", p);
+            try users_arr.append(.{ .object = obj });
+        }
+        var root = std.json.ObjectMap.init(sa);
+        try root.put("users", .{ .array = users_arr });
+
+        const json_bytes = try std.json.Stringify.valueAlloc(sa, std.json.Value{ .object = root }, .{ .whitespace = .indent_2 });
+
+        const tmp_name = USERS_FILE ++ ".tmp";
+        {
+            var f = try iam_dir.createFile(tmp_name, .{ .mode = 0o600 });
+            defer f.close();
+            try f.writeAll(json_bytes);
+        }
+        try iam_dir.rename(tmp_name, USERS_FILE);
+    }
+
+    /// Secret-free JSON view of the user list: `{"users":[{"access_key",
+    /// "enabled","has_policy"},...]}`. Never includes `secret_key`.
+    pub fn listUsersJson(self: *const Store, allocator: Allocator) ![]u8 {
+        const mut_self: *Store = @constCast(self);
+        mut_self.mutex.lock();
+        defer mut_self.mutex.unlock();
+
+        var out = std.ArrayList(u8){};
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, "{\"users\":[");
+        for (self.users, 0..) |u, i| {
+            if (i > 0) try out.append(allocator, ',');
+            const entry = try std.fmt.allocPrint(
+                allocator,
+                "{{\"access_key\":\"{s}\",\"enabled\":{s},\"has_policy\":{s}}}",
+                .{ u.access_key, if (u.enabled) "true" else "false", if (u.policy != null) "true" else "false" },
+            );
+            defer allocator.free(entry);
+            try out.appendSlice(allocator, entry);
+        }
+        try out.appendSlice(allocator, "]}");
+        return out.toOwnedSlice(allocator);
     }
 };
 
@@ -375,14 +509,12 @@ pub fn evaluatePolicy(
     return .none;
 }
 
-/// Decide whether `principal` may perform `action` on `bucket`/`key`.
-/// Root always passes (bypasses policy entirely, MinIO-style). Otherwise
-/// combines the principal's own inline policy (if any) with the bucket
-/// policy (if any); an explicit Deny from either source wins. With no
-/// explicit decision: authenticated non-root users default-deny (must be
-/// granted), anonymous requests (principal == null, auth not required)
-/// default-allow to preserve pre-IAM behavior.
-pub fn authorize(
+/// Core authorization ignoring any session policy: root bypass, then
+/// combine the principal's inline user policy with the bucket policy
+/// (explicit Deny from either wins). Shared by `authorize` both directly
+/// (no session policy) and as the "base" half of the session-policy
+/// intersection below.
+fn authorizeBase(
     store: *const Store,
     bucket_policy_json: ?[]const u8,
     principal: ?Principal,
@@ -426,6 +558,46 @@ pub fn authorize(
     if (saw_deny) return false;
     if (saw_allow) return true;
     return principal == null;
+}
+
+/// Decide whether `principal` may perform `action` on `bucket`/`key`.
+/// Root always passes the base check (bypasses policy entirely,
+/// MinIO-style). Otherwise combines the principal's own inline policy (if
+/// any) with the bucket policy (if any); an explicit Deny from either
+/// source wins. With no explicit decision: authenticated non-root users
+/// default-deny (must be granted), anonymous requests (principal == null,
+/// auth not required) default-allow to preserve pre-IAM behavior.
+///
+/// When `principal.session_policy` is set (STS temp credentials), the
+/// final decision is the *intersection* of the session policy and the base
+/// check: the session policy must contain an explicit Allow for the
+/// action/resource (a Deny, or no matching statement at all, both fail
+/// closed here — there's no "default allow" for a session policy) AND the
+/// base check must also allow it. A session policy can only narrow what
+/// its base principal could otherwise do; this includes root — a root
+/// session carrying a restrictive session policy has its usual bypass
+/// gated by that policy instead of short-circuiting.
+pub fn authorize(
+    store: *const Store,
+    bucket_policy_json: ?[]const u8,
+    principal: ?Principal,
+    action: []const u8,
+    bucket: []const u8,
+    key: []const u8,
+    scratch: Allocator,
+) bool {
+    if (principal) |p| {
+        if (p.session_policy) |sp_json| {
+            if (std.json.parseFromSliceLeaky(std.json.Value, scratch, sp_json, .{})) |doc| {
+                if (evaluatePolicy(doc, p.access_key, action, bucket, key, false) != .allow) return false;
+            } else |e| {
+                std.log.warn("iam: malformed session policy: {}", .{e});
+                return false;
+            }
+            return authorizeBase(store, bucket_policy_json, principal, action, bucket, key, scratch);
+        }
+    }
+    return authorizeBase(store, bucket_policy_json, principal, action, bucket, key, scratch);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -490,6 +662,92 @@ test "Store.load missing file returns empty store" {
     defer store.deinit();
     try std.testing.expectEqual(@as(usize, 0), store.users.len);
     try std.testing.expect(store.findUser("nope") == null);
+}
+
+test "upsertUser/removeUser: persist round-trips across a fresh load, remove sticks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = load(std.testing.allocator, tmp.dir);
+        defer store.deinit();
+
+        try store.upsertUser(tmp.dir, "AKIAUSER1", "secret-one-long-enough", null, true);
+        const policy_json =
+            \\{"Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::*"}]}
+        ;
+        try store.upsertUser(tmp.dir, "AKIAUSER2", "secret-two-long-enough", policy_json, false);
+
+        try std.testing.expectEqual(@as(usize, 2), store.users.len);
+    }
+
+    // A fresh Store.load must see both users, including the policy, from
+    // what upsertUser persisted to disk.
+    {
+        var store = load(std.testing.allocator, tmp.dir);
+        defer store.deinit();
+        try std.testing.expectEqual(@as(usize, 2), store.users.len);
+
+        // findUser only returns enabled users; AKIAUSER2 was persisted
+        // disabled, so it round-trips into the slice but not via findUser.
+        var found2 = false;
+        for (store.users) |u| {
+            if (std.mem.eql(u8, u.access_key, "AKIAUSER2")) {
+                found2 = true;
+                try std.testing.expectEqualStrings("secret-two-long-enough", u.secret_key);
+                try std.testing.expect(!u.enabled);
+                try std.testing.expect(u.policy != null);
+            }
+        }
+        try std.testing.expect(found2);
+
+        const found1 = store.findUser("AKIAUSER1") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("secret-one-long-enough", found1.secret_key);
+
+        const removed = try store.removeUser(tmp.dir, "AKIAUSER1");
+        try std.testing.expect(removed);
+        try std.testing.expectEqual(@as(usize, 1), store.users.len);
+
+        const removed_again = try store.removeUser(tmp.dir, "AKIAUSER1");
+        try std.testing.expect(!removed_again);
+    }
+
+    // And the removal persisted too.
+    {
+        var store = load(std.testing.allocator, tmp.dir);
+        defer store.deinit();
+        try std.testing.expectEqual(@as(usize, 1), store.users.len);
+        try std.testing.expect(store.findUser("AKIAUSER1") == null);
+    }
+
+    // The file itself is sane: present, non-empty, valid JSON.
+    var iam_dir = try tmp.dir.openDir(IAM_DIR, .{});
+    defer iam_dir.close();
+    const bytes = try iam_dir.readFileAlloc(std.testing.allocator, USERS_FILE, MAX_USERS_FILE_BYTES);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(bytes.len > 0);
+    var parse_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parse_arena.deinit();
+    _ = try std.json.parseFromSliceLeaky(std.json.Value, parse_arena.allocator(), bytes, .{});
+}
+
+test "listUsersJson lists access keys and never leaks secret_key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = load(std.testing.allocator, tmp.dir);
+    defer store.deinit();
+
+    try store.upsertUser(tmp.dir, "AKIAUSER1", "super-secret-value-1", null, true);
+    try store.upsertUser(tmp.dir, "AKIAUSER2", "super-secret-value-2", null, true);
+
+    const json = try store.listUsersJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "AKIAUSER1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "AKIAUSER2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "super-secret-value-1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "super-secret-value-2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "secret_key") == null);
 }
 
 test "evaluatePolicy deny wins over allow" {
@@ -619,4 +877,60 @@ test "mapAction bucket encryption subresource" {
     try std.testing.expectEqualStrings("s3:PutEncryptionConfiguration", mapAction(.PUT, "b", "", "encryption"));
     try std.testing.expectEqualStrings("s3:GetEncryptionConfiguration", mapAction(.GET, "b", "", "encryption"));
     try std.testing.expectEqualStrings("s3:PutEncryptionConfiguration", mapAction(.DELETE, "b", "", "encryption"));
+}
+
+test "authorize session policy narrows a user's own permissions" {
+    var store_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const sa = store_arena.allocator();
+    const user_policy_json =
+        \\{"Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::b/*","arn:aws:s3:::b"]}]}
+    ;
+    const user_pol = try std.json.parseFromSliceLeaky(std.json.Value, sa, user_policy_json, .{});
+    var users = [_]User{.{ .access_key = "AKIAUSER1", .secret_key = "s1", .enabled = true, .policy = user_pol }};
+    var store = Store{ .arena = store_arena, .users = &users };
+    defer store.deinit();
+
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+
+    // Session policy only grants GetObject (a subset of the base user
+    // policy, which also has ListBucket): the intersection should allow
+    // GetObject but deny ListBucket even though the base policy allows it.
+    const session_policy =
+        \\{"Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::b/*"}]}
+    ;
+    const principal = Principal{ .access_key = "AKIAUSER1", .is_root = false, .session_policy = session_policy };
+    try std.testing.expect(authorize(&store, null, principal, "s3:GetObject", "b", "x", scratch.allocator()));
+    try std.testing.expect(!authorize(&store, null, principal, "s3:ListBucket", "b", "", scratch.allocator()));
+}
+
+test "authorize session policy gates root's usual bypass" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    var store = Store{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .users = &.{} };
+    defer store.deinit();
+
+    const session_policy =
+        \\{"Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::b/*"}]}
+    ;
+    const principal = Principal{ .access_key = "root", .is_root = true, .session_policy = session_policy };
+    // Root's normal all-access bypass is gated by the session policy: only
+    // the action the session policy allows should pass.
+    try std.testing.expect(authorize(&store, null, principal, "s3:GetObject", "b", "x", scratch.allocator()));
+    try std.testing.expect(!authorize(&store, null, principal, "s3:PutObject", "b", "x", scratch.allocator()));
+}
+
+test "authorize session policy with no matching Allow fails closed" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    var store = Store{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .users = &.{} };
+    defer store.deinit();
+
+    // Empty statement list: no Allow anywhere, so intersection denies even
+    // for root.
+    const session_policy =
+        \\{"Statement":[]}
+    ;
+    const principal = Principal{ .access_key = "root", .is_root = true, .session_policy = session_policy };
+    try std.testing.expect(!authorize(&store, null, principal, "s3:GetObject", "b", "x", scratch.allocator()));
 }

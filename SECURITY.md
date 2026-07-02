@@ -5,7 +5,7 @@
 - **In scope** — request smuggling, path traversal, unauthorised access via
   forged signatures, unauthorised access via policy enforcement, request-size
   DoS, slowloris.
-- **Out of scope / partial** — external key management (KMS), ACLs, STS,
+- **Out of scope / partial** — external key management (KMS), ACLs, LDAP,
   multi-tenant isolation beyond IAM policy, audit logging beyond access logs.
 
 ## Network exposure
@@ -66,6 +66,37 @@ Simpaniz implements AWS Signature V4 verification:
 - **Anonymous mode** — when `SIMPANIZ_ACCESS_KEY` is unset, the server
   serves anonymous requests, default-allow unless a bucket policy denies.
   **Do not run anonymous mode on a network anyone else can reach.**
+
+## STS
+
+`sts.zig` issues temporary credentials via two operations:
+
+- **`AssumeRole`** — SigV4-signed, root or an IAM user only. Optional
+  session `Policy` narrows the resulting permissions further: it
+  **intersects** with the caller's base policy (statements must satisfy
+  both), so a session policy also gates the root principal — it cannot be
+  used to escalate.
+- **`AssumeRoleWithWebIdentity`** — unsigned (anyone can call it), so all
+  trust is in JWT validation: signature (ES256 fully verified; RS256 via
+  bigint modexp), `iss` matches `SIMPANIZ_OIDC_ISSUER`, `aud` matches
+  `SIMPANIZ_OIDC_AUDIENCE` when configured, `exp` not passed. The token's
+  policy claim (or `SIMPANIZ_OIDC_DEFAULT_POLICY`) selects a named policy
+  file under `.simpaniz-iam/policies/` — this is the only permission
+  surface for web-identity sessions.
+- Temp credentials (`x-amz-security-token`) are held **in-memory only**;
+  a server restart invalidates every outstanding session — there is no
+  persisted revocation list to manage separately.
+- Duration is clamped to AWS's 900–43200 s range regardless of what's
+  requested.
+
+## Admin API
+
+`/_admin/*` (`admin.zig`) is **root-only** — any non-root caller, including
+one with a broad IAM policy, gets `403`. Responses never include secret
+keys: `user list` and `config` echo access keys and metadata only. Treat
+`SIMPANIZ_ACCESS_KEY`/`SIMPANIZ_SECRET_KEY` used by the `simpaniz admin` CLI
+with the same care as root credentials — anyone who has them can create,
+delete, and repolicy every IAM user.
 
 ## Path traversal
 

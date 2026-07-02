@@ -8,6 +8,9 @@ const iam = @import("iam.zig");
 const events = @import("events.zig");
 const tls_server = @import("tls_server.zig");
 const index_mod = @import("index.zig");
+const tiering_mod = @import("tiering.zig");
+const sts = @import("sts.zig");
+const admin_cli = @import("admin_cli.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -15,6 +18,16 @@ pub fn main() !void {
     var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
+
+    // `simpaniz admin ...` is a CLI client against a running server's
+    // `/_admin/*` REST API (see `admin_cli.zig`) — it never starts a
+    // server, so this dispatch happens before any config/data-dir/listener
+    // setup below.
+    const args = try std.process.argsAlloc(gpa);
+    defer std.process.argsFree(gpa, args);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "admin")) {
+        return admin_cli.run(gpa, args[2..]);
+    }
 
     var config = Config.load(gpa);
     defer config.deinit();
@@ -55,6 +68,13 @@ pub fn main() !void {
     defer iam_store.deinit();
     std.log.info("IAM: {d} user(s) loaded", .{iam_store.users.len});
 
+    var sts_store = sts.StsStore.init(gpa);
+    defer sts_store.deinit();
+
+    var oidc_config = sts.OidcConfig.load(gpa, data_dir);
+    defer oidc_config.deinit();
+    std.log.info("STS enabled; OIDC: {s}", .{if (oidc_config.enabled) "on" else "off"});
+
     var registry = metrics.Registry{ .started_unix = std.time.timestamp() };
 
     // Cluster runtime — only built when SIMPANIZ_NODE_ID is set.
@@ -93,6 +113,15 @@ pub fn main() !void {
     var index_mgr = index_mod.Manager.init(gpa, data_dir);
     defer index_mgr.deinit();
 
+    // Cold-storage tiering target for lifecycle Transition rules — off
+    // unless SIMPANIZ_TIER_DIR or SIMPANIZ_TIER_URL is set.
+    var tiering_ctx = tiering_mod.Tiering.init(gpa);
+    switch (tiering_ctx.mode) {
+        .off => {},
+        .local => std.log.info("tiering enabled: mode=local", .{}),
+        .remote => std.log.info("tiering enabled: mode=remote url={s} bucket={s}", .{ tiering_ctx.url, tiering_ctx.tier_bucket }),
+    }
+
     server.installSignalHandlers();
     try server.start(.{
         .config = &config,
@@ -104,6 +133,9 @@ pub fn main() !void {
         .notifier = notifier,
         .tls = tls_ctx,
         .index = if (cluster_rt == null) &index_mgr else null,
+        .tiering = &tiering_ctx,
+        .sts = &sts_store,
+        .oidc = &oidc_config,
     });
 }
 
@@ -122,4 +154,9 @@ test {
     _ = @import("events.zig");
     _ = @import("tls_server.zig");
     _ = @import("index.zig");
+    _ = @import("tiering.zig");
+    _ = @import("sts.zig");
+    _ = @import("admin.zig");
+    _ = @import("admin_cli.zig");
+    _ = @import("s3_client.zig");
 }
