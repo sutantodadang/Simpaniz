@@ -33,12 +33,16 @@
 <div id="app-view" class="hidden">
   <header class="topbar">
     <div class="brand">simpaniz</div>
+    <nav class="tabs">
+      <button id="tab-buckets" class="tab active">Buckets</button>
+      <button id="tab-metrics" class="tab">Metrics</button>
+    </nav>
     <div class="grow"></div>
     <span id="who" class="muted"></span>
     <button id="logout" class="link">Sign out</button>
   </header>
 
-  <div class="layout">
+  <div id="layout" class="layout">
     <aside class="sidebar">
       <div class="side-head">
         <h2>Buckets</h2>
@@ -71,10 +75,41 @@
       </section>
     </main>
   </div>
+
+  <div id="metrics-view" class="metrics-view hidden">
+    <div class="metrics-toolbar">
+      <div class="window-select">
+        <button class="win-btn" data-window="900">15m</button>
+        <button class="win-btn active" data-window="3600">1h</button>
+        <button class="win-btn" data-window="21600">6h</button>
+        <button class="win-btn" data-window="86400">24h</button>
+      </div>
+    </div>
+    <div id="metrics-cards" class="cards-row"></div>
+    <div class="charts-grid">
+      <div class="chart-card">
+        <div class="chart-head"><h3>Requests / Errors per second</h3><div id="legend-reqs" class="legend"></div></div>
+        <canvas id="chart-reqs"></canvas>
+      </div>
+      <div class="chart-card">
+        <div class="chart-head"><h3>Latency (ms)</h3><div id="legend-latency" class="legend"></div></div>
+        <canvas id="chart-latency"></canvas>
+      </div>
+      <div class="chart-card">
+        <div class="chart-head"><h3>Throughput (bytes/s)</h3><div id="legend-throughput" class="legend"></div></div>
+        <canvas id="chart-throughput"></canvas>
+      </div>
+      <div class="chart-card">
+        <div class="chart-head"><h3>In-flight requests</h3><div id="legend-inflight" class="legend"></div></div>
+        <canvas id="chart-inflight"></canvas>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div id="toast" class="toast hidden"></div>
 
 <script src="/console/app.js"></script>
+<script src="/console/dashboard.js"></script>
 </body>
 </html>

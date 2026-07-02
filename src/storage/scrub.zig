@@ -59,6 +59,12 @@ fn scrubBucket(bd: Dir, bucket_name: []const u8, allocator: std.mem.Allocator, s
             stats.skipped += 1;
             continue;
         }
+        if (meta.tiered) {
+            // Local bytes are a zero-byte stub post-transition; the real
+            // content lives on the cold tier, nothing to verify here.
+            stats.skipped += 1;
+            continue;
+        }
         if (std.mem.indexOfScalar(u8, meta.etag, '-') != null) {
             // Multipart composite ETag (md5sum-of-md5s + "-N"). Skip.
             stats.skipped += 1;
@@ -89,6 +95,7 @@ fn scrubBucket(bd: Dir, bucket_name: []const u8, allocator: std.mem.Allocator, s
 fn freeMeta(allocator: std.mem.Allocator, meta: anytype) void {
     allocator.free(meta.content_type);
     allocator.free(meta.etag);
+    allocator.free(meta.storage_class);
     if (meta.encryption) |enc| {
         allocator.free(enc.alg);
         allocator.free(enc.wrapped_dek_b64);

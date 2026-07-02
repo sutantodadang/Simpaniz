@@ -61,6 +61,39 @@ src/
                     Serves `ListObjectsV2` with flat memory on huge buckets;
                     falls back to FS-walk-and-sort with lazy bootstrap.
                     Single-node only — cluster listing still FS-walk.
+  tiering.zig       Lifecycle `<Transition>` cold-storage tiering. Moves
+                    on-disk bytes to `SIMPANIZ_TIER_DIR` (local) or a
+                    SigV4-signed remote S3-compatible target
+                    (`SIMPANIZ_TIER_URL`/`_BUCKET`/`_ACCESS_KEY`/`_SECRET_KEY`),
+                    leaves a zero-byte stub, and transparently re-fetches on
+                    GET/HEAD (spooled to a temp file).
+  sts.zig           STS: `AssumeRole` (SigV4-signed) and
+                    `AssumeRoleWithWebIdentity` (unsigned, OIDC JWT — ES256
+                    fully verified, RS256 via bigint modexp; JWKS fetched
+                    from `SIMPANIZ_OIDC_JWKS_URL`). Issues in-memory temp
+                    credentials (`x-amz-security-token`); session `Policy`
+                    intersects base permissions.
+  admin.zig         Root-only REST under `/_admin/`: info, users CRUD,
+                    policies CRUD, cluster, sanitized config. Never returns
+                    secrets.
+  admin_cli.zig     `simpaniz admin <cmd>` — SigV4-signed client for
+                    `admin.zig`'s API, shipped in the same binary (no
+                    separate `mc`-style tool).
+  s3_client.zig     Minimal SigV4-signing HTTP client shared by
+                    `admin_cli.zig` and `tiering.zig`'s remote mode.
+  ui.zig            Embedded web console: serves `/console/*` static assets
+                    (HTML/CSS/JS, `ui_assets/`) ahead of SigV4 enforcement;
+                    the console's own S3/dashboard calls are signed
+                    in-browser and go through normal auth.
+  timeseries.zig    In-process 24h metric history: background sampler
+                    (`SIMPANIZ_METRICS_SAMPLE_S`, default 10s) snapshots
+                    `metrics.Registry` into an 8640-point ring; derives
+                    per-second rates and p50/p95/p99 latency from
+                    histogram-bucket deltas. In-memory only.
+  dashboard.zig     Read-only `/_dashboard/api/{summary,series}` REST,
+                    SigV4-authenticated, backed by `metrics.zig` +
+                    `timeseries.zig`. Powers the console's Metrics tab —
+                    single-binary alternative to Prometheus/Grafana.
 ```
 
 ## Request lifecycle
@@ -129,11 +162,15 @@ checks.
 
 ## Where it still deviates from MinIO
 
-- No ACLs or STS (AssumeRole, OIDC, LDAP); IAM/policy enforcement and
-  in-process TLS are done (see `iam.zig`, `tls_server.zig`).
-- SSE-KMS uses a local keyring, not an external/pluggable KMS. Object Lock,
-  Lifecycle, and Versioning exist only for selected flows; see
+- No ACLs or LDAP; IAM/policy enforcement, in-process TLS, and STS
+  (`AssumeRole`/`AssumeRoleWithWebIdentity`) are done (see `iam.zig`,
+  `tls_server.zig`, `sts.zig`). STS credentials are in-memory only.
+- SSE-KMS uses a local keyring, not an external/pluggable KMS. Versioning,
+  Lifecycle, and Object Lock default-retention are now complete
+  (`versioning.zig`, `lifecycle.zig`, `object_lock_config.zig`); see
   `COMPATIBILITY.md` for the exact matrix.
+- Tiering (`tiering.zig`) supports a local cold dir or one remote
+  S3-compatible target; no native GCS/Azure backend, no rehydration policy.
 - Distributed erasure-coded mode has SWIM-lite membership + rebalance now
   (`membership.zig`, `rebalance.zig`), and PUT/GET/heal are stripe-streamed
   (no more full-object EC buffers). Still no Raft, no decommission.

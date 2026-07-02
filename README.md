@@ -20,6 +20,9 @@ See [`COMPATIBILITY.md`](./COMPATIBILITY.md) for the S3 operation matrix and
   ETag), virtual-host-style addressing, CORS preflight.
 - **AWS Signature V4** — header form and presigned URL form, with
   region binding. Anonymous mode when no credentials are configured.
+- **STS** — `AssumeRole` (SigV4-signed) and `AssumeRoleWithWebIdentity`
+  (unsigned, OIDC JWT, ES256/RS256) issue temporary credentials; see
+  `SIMPANIZ_OIDC_*` below.
 - **IAM / policy enforcement** — multi-user credential store at
   `<DATA_DIR>/.simpaniz-iam/users.json`; AWS-style bucket and inline user
   policy evaluation (explicit Deny wins, then Allow, default-deny for
@@ -100,6 +103,18 @@ All configuration is via environment variables.
 | `SIMPANIZ_PROBE_FAILS`       | `3`            | Cluster mode: consecutive probe failures before a node is marked `down`. |
 | `SIMPANIZ_REBALANCE_INTERVAL_S` | `300`       | Cluster mode: shard-rebalance sweep interval (s). `0` disables the daemon. |
 | `SIMPANIZ_JOIN`              | *(empty)*      | Cluster mode: `1`/`true` — announce this node to configured peers on boot via `POST /_simpaniz/join`. |
+| `SIMPANIZ_TIER_DIR`          | *(empty)*      | Local cold-storage tiering target: a second on-disk root. Lifecycle `<Transition>` copies aged objects here and leaves a stub locally. |
+| `SIMPANIZ_TIER_URL`          | *(empty)*      | Remote cold-storage tiering target: base URL of an S3-compatible endpoint. Requires `SIMPANIZ_TIER_BUCKET`/`SIMPANIZ_TIER_ACCESS_KEY`/`SIMPANIZ_TIER_SECRET_KEY`. Mutually exclusive with `SIMPANIZ_TIER_DIR`. |
+| `SIMPANIZ_TIER_BUCKET`       | *(empty)*      | Bucket name on the remote tiering target. |
+| `SIMPANIZ_TIER_ACCESS_KEY`   | *(empty)*      | Access key for SigV4-signing requests to the remote tiering target. |
+| `SIMPANIZ_TIER_SECRET_KEY`   | *(empty)*      | Secret key for SigV4-signing requests to the remote tiering target. |
+| `SIMPANIZ_TIER_REGION`       | `us-east-1`    | Region used to sign requests to the remote tiering target. |
+| `SIMPANIZ_OIDC_JWKS_URL`     | *(empty)*      | Presence enables `AssumeRoleWithWebIdentity`. JWKS endpoint used to verify OIDC JWTs (ES256/RS256). |
+| `SIMPANIZ_OIDC_ISSUER`       | *(empty)*      | Required OIDC `iss` claim when `SIMPANIZ_OIDC_JWKS_URL` is set. |
+| `SIMPANIZ_OIDC_AUDIENCE`     | *(empty)*      | Optional OIDC `aud` claim to enforce. |
+| `SIMPANIZ_OIDC_DEFAULT_POLICY` | *(empty)*    | Optional named policy file (under `.simpaniz-iam/policies/`) applied when the JWT carries no policy claim. |
+| `SIMPANIZ_ADMIN_ENDPOINT`    | `http://127.0.0.1:9000` | Endpoint the `simpaniz admin` CLI targets. |
+| `SIMPANIZ_METRICS_SAMPLE_S`  | `10`           | Background sampler period (seconds) for the in-process 24h metric history that powers the console's Metrics tab. `0` disables the sampler; `/_dashboard/api/*` still answers, `/summary` from live counters, `/series` with no points. |
 
 ## Endpoints
 
@@ -117,6 +132,8 @@ matrix. Most clients (`curl`, `aws s3`, `boto3`, `aws-sdk-go`,
 | `/readyz`   | GET    | Readiness — data directory writable.               |
 | `/metrics`  | GET    | Prometheus exposition format.                      |
 | `/console/` | GET    | Embedded web console (single-page admin UI).       |
+| `/_dashboard/api/summary` | GET | SigV4-authenticated JSON: uptime, totals, latency percentiles, mode, TLS, IAM users, tiering, cluster states. Powers the console's Metrics tab. |
+| `/_dashboard/api/series`  | GET | SigV4-authenticated JSON time series (`?window=60..86400` seconds) from the in-process 24h metric history. |
 
 ### Web console
 
@@ -140,6 +157,35 @@ talks to the existing S3 API. SigV4 is computed in the browser via Web
 Crypto, so every action is authenticated the same way as a `curl` or
 `aws s3` call. Credentials are kept in `sessionStorage` and never sent
 anywhere except as part of the S3 signature.
+
+#### Metrics dashboard
+
+The console's **Metrics** tab is a built-in, single-binary alternative to a
+Prometheus + Grafana stack — no external scraper or dashboard service
+required. It draws dependency-free canvas line charts (requests/errors per
+second, latency p50/p95/p99, throughput, in-flight requests), summary cards,
+and cluster node-state dots, over 15m/1h/6h/24h windows with a 10s
+auto-refresh. Data comes from an in-process 24h ring buffer (sampled every
+`SIMPANIZ_METRICS_SAMPLE_S` seconds, default 10; in-memory only, cleared on
+restart) served by the SigV4-authenticated `/_dashboard/api/*` endpoints
+above. The plain-text `/metrics` Prometheus endpoint is unaffected and still
+available for external scraping.
+
+## Admin CLI
+
+`simpaniz admin` is the client half of the root-only `/_admin/` REST API,
+shipped in the **same binary** as the server — no separate `mc`-style tool.
+Requests are SigV4-signed against `SIMPANIZ_ADMIN_ENDPOINT` (default
+`http://127.0.0.1:9000`) using `SIMPANIZ_ACCESS_KEY`/`SIMPANIZ_SECRET_KEY`.
+
+```bash
+export SIMPANIZ_ACCESS_KEY=... SIMPANIZ_SECRET_KEY=...
+
+simpaniz admin info
+simpaniz admin user add alice s3cr3t --policy ./read-only.json
+simpaniz admin policy set read-only ./read-only.json
+simpaniz admin cluster
+```
 
 ## Usage examples
 
@@ -207,13 +253,16 @@ DATA_DIR/
 These are real engineering investments — they're documented as
 current limits, not "coming soon":
 
-- **ACLs, STS, external identity (OIDC/LDAP).** IAM/policy enforcement and
-  in-process TLS 1.3 are done; per-object ACLs and STS AssumeRole are not.
+- **ACLs, LDAP.** IAM/policy enforcement, in-process TLS 1.3, and STS
+  (`AssumeRole` / `AssumeRoleWithWebIdentity` via OIDC) are done; per-object
+  ACLs and LDAP are not. STS credentials are in-memory only — a restart
+  invalidates them.
 - **External KMS.** SSE-KMS uses a local keyring (master-key wrap), not a
   pluggable external KMS; no key rotation primitives.
-- **Versioning/lifecycle/object-lock completeness.** Core flows exist, but
-  suspended versioning, lifecycle transitions/noncurrent expiry/tag filters,
-  and full AWS Object Lock semantics are partial.
+- **Tiering backends.** Lifecycle `<Transition>` moves cold objects to a
+  local dir (`SIMPANIZ_TIER_DIR`) or a remote S3-compatible endpoint
+  (`SIMPANIZ_TIER_URL`); no native GCS/Azure backend, no rehydration policy
+  (GET always re-fetches from cold).
 - **Cluster maturity.** SWIM-lite membership (active health probing, gossip,
   dynamic join) and an HRW rebalance daemon now exist, but there's no Raft, no
   decommission, and limited cluster-mode support for advanced bucket

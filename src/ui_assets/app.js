@@ -162,6 +162,15 @@
     return { status: resp.status, text, headers: resp.headers };
   }
 
+  // Generic signed GET returning parsed JSON — used by dashboard.js to
+  // call `/_dashboard/api/*` with the same SigV4 signing as the S3 calls
+  // above, without duplicating the signing logic in a second file.
+  async function apiGet(path, query = '') {
+    const { text } = await s3({ method: 'GET', path, query });
+    return JSON.parse(text);
+  }
+  window.simpanizApiGet = apiGet;
+
   function parseS3Error(xml) {
     try {
       const doc = new DOMParser().parseFromString(xml, 'text/xml');
@@ -426,8 +435,22 @@
     renderBuckets();
   }
 
+  // ── Tabs (Buckets / Metrics) ─────────────────────────────────────────
+  // dashboard.js listens for the `simpaniz:tab` event to start/stop its
+  // 10s auto-refresh poll without app.js needing to know it exists.
+  function switchTab(tab) {
+    $('tab-buckets').classList.toggle('active', tab === 'buckets');
+    $('tab-metrics').classList.toggle('active', tab === 'metrics');
+    $('layout').classList.toggle('hidden', tab !== 'buckets');
+    $('metrics-view').classList.toggle('hidden', tab !== 'metrics');
+    document.dispatchEvent(new CustomEvent('simpaniz:tab', { detail: { tab } }));
+  }
+
   // ── Wire up ───────────────────────────────────────────────────────────
   function init() {
+    $('tab-buckets').addEventListener('click', () => switchTab('buckets'));
+    $('tab-metrics').addEventListener('click', () => switchTab('metrics'));
+
     $('login-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       $('login-error').textContent = '';

@@ -14,6 +14,13 @@ const util = @import("util.zig");
 const cluster = @import("cluster.zig");
 const events = @import("events.zig");
 const index_mod = @import("index.zig");
+const tiering_mod = @import("tiering.zig");
+const storage_paths = @import("storage/paths.zig");
+const iam = @import("iam.zig");
+const sts_mod = @import("sts.zig");
+const Config = @import("config.zig");
+const metrics = @import("metrics.zig");
+const timeseries = @import("timeseries.zig");
 
 pub const HandlerContext = struct {
     data_dir: std.fs.Dir,
@@ -31,7 +38,51 @@ pub const HandlerContext = struct {
     /// Persistent object-listing index. ponytail: index is single-node only;
     /// cluster mode (ctx.cluster != null) always falls back to the FS walk.
     index: ?*index_mod.Manager = null,
+    /// Cold-storage tiering target for lifecycle Transition rules, or null.
+    tiering: ?*tiering_mod.Tiering = null,
+    /// STS temp-credential store, or null when STS is not wired up (should
+    /// always be set by `server.zig` in practice).
+    sts_store: ?*sts_mod.StsStore = null,
+    /// OIDC config for AssumeRoleWithWebIdentity, or null when not wired up.
+    oidc: ?*sts_mod.OidcConfig = null,
+    /// Verified caller identity for this request (set by `server.zig`'s
+    /// auth block), or null for anonymous/unauthenticated requests.
+    principal: ?iam.Principal = null,
+    /// IAM user store — used by the `/_admin/` API (user CRUD, listing).
+    /// Null only in handler unit tests that don't exercise admin routes.
+    iam: ?*iam.Store = null,
+    /// Server configuration snapshot — used by `/_admin/config` and
+    /// `/_admin/info`. Null only in handler unit tests that don't exercise
+    /// admin routes.
+    config: ?*const Config = null,
+    /// Process start time (unix seconds), mirrors `metrics.Registry.started_unix`
+    /// — used by `/_admin/info` for uptime. 0 in tests.
+    started_unix: i64 = 0,
+    /// Metrics registry — used by `/_dashboard/api/summary` for live gauge
+    /// and counter values. Null only in handler unit tests that don't
+    /// exercise dashboard routes.
+    registry: ?*metrics.Registry = null,
+    /// In-process metric history sampler, or null when the sampler is
+    /// disabled (`SIMPANIZ_METRICS_SAMPLE_S=0`) — `/_dashboard/api/series`
+    /// then returns an empty point list.
+    tseries: ?*timeseries.Store = null,
 };
+
+// ── STS (root POST dispatch: Action=AssumeRole[WithWebIdentity]) ────────────
+
+pub fn sts(ctx: HandlerContext, req: *http.Request) http.Response {
+    const action = qp(req.query, "Action") orelse return errResp(ctx, 400, "Bad Request", "InvalidAction", "Missing Action parameter.", "/");
+    if (std.mem.eql(u8, action, "AssumeRole")) {
+        const store = ctx.sts_store orelse return errResp(ctx, 500, "Internal Server Error", "InternalError", "STS not configured.", "/");
+        return sts_mod.handleAssumeRole(ctx.allocator, store, ctx.principal, req.query, ctx.request_id);
+    }
+    if (std.mem.eql(u8, action, "AssumeRoleWithWebIdentity")) {
+        const store = ctx.sts_store orelse return errResp(ctx, 500, "Internal Server Error", "InternalError", "STS not configured.", "/");
+        const oidc = ctx.oidc orelse return errResp(ctx, 400, "Bad Request", "InvalidIdentityToken", "OIDC not configured.", "/");
+        return sts_mod.handleAssumeRoleWithWebIdentity(ctx.allocator, store, oidc, req.query, ctx.request_id);
+    }
+    return errResp(ctx, 400, "Bad Request", "InvalidAction", "Unknown Action.", "/");
+}
 
 // ── Bucket-level ─────────────────────────────────────────────────────────────
 
@@ -149,8 +200,45 @@ pub fn putObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
     // Object Lock: block overwrite if currently protected.
     if (objectIsCurrentlyProtected(ctx, bucket, key, req)) |resp| return resp;
 
-    // Versioning snapshot: if Enabled, copy current version aside before overwrite.
-    snapshotIfVersioned(ctx, bucket, key);
+    // Versioning: resolve state, snapshot the outgoing current version when
+    // it must be preserved, and decide the version id the *new* current
+    // object will carry.
+    //   Enabled   -> always snapshot current (any), new object gets a fresh vid.
+    //   Suspended -> snapshot current only if it's a real (non-null) vid
+    //                (i.e. written while Enabled); the new object becomes
+    //                the null version, replacing any existing null version.
+    //   disabled  -> no snapshot, no version id tracked.
+    const vstate = storage.getBucketVersioning(ctx.data_dir, bucket) catch .disabled;
+    var new_vid_buf: [16]u8 = undefined;
+    var new_vid: []const u8 = "null";
+    resolve_vid: {
+        var bd = ctx.data_dir.openDir(bucket, .{}) catch break :resolve_vid;
+        defer bd.close();
+        switch (vstate) {
+            .enabled => {
+                // Snapshot the outgoing object under its OWN tracked vid so
+                // the id returned on its PUT stays resolvable afterward; a
+                // "null" outgoing vid (or untracked legacy object) gets a
+                // freshly minted archive id instead (nulls aren't distinct
+                // client-visible ids).
+                const cur_vid = storage.currentVersionId(bd, ctx.allocator, key) catch break :resolve_vid;
+                defer ctx.allocator.free(cur_vid);
+                const hint: ?[]const u8 = if (std.mem.eql(u8, cur_vid, "null")) null else cur_vid;
+                _ = storage.snapshotCurrentVersion(bd, ctx.allocator, key, hint) catch {};
+                storage.newVersionId(&new_vid_buf);
+                new_vid = &new_vid_buf;
+            },
+            .suspended => {
+                const cur_vid = storage.currentVersionId(bd, ctx.allocator, key) catch break :resolve_vid;
+                defer ctx.allocator.free(cur_vid);
+                if (!std.mem.eql(u8, cur_vid, "null")) {
+                    _ = storage.snapshotCurrentVersion(bd, ctx.allocator, key, cur_vid) catch {};
+                }
+                new_vid = "null";
+            },
+            .disabled => {},
+        }
+    }
 
     const ct = req.content_type;
     const md5_hdr = req.header("content-md5") orelse "";
@@ -185,6 +273,16 @@ pub fn putObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
     // Tell the server we consumed the body so it doesn't try to drain.
     req.body_consumed = req.content_length;
 
+    // Persist the version id decided above as the new current object's
+    // tracked version (sidecar next to the meta json).
+    if (vstate != .disabled) {
+        if (ctx.data_dir.openDir(bucket, .{}) catch null) |bd_opt| {
+            var bd2 = bd_opt;
+            defer bd2.close();
+            storage.setCurrentVersionId(bd2, ctx.allocator, key, new_vid) catch {};
+        }
+    }
+
     // Auto-apply bucket default retention on first PUT, when configured and
     // the request didn't carry an explicit x-amz-object-lock-mode header.
     if (!had_existing and req.header("x-amz-object-lock-mode") == null) {
@@ -202,6 +300,9 @@ pub fn putObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
 
     var hdrs_list = std.ArrayList([]const u8){};
     hdrs_list.append(ctx.allocator, std.fmt.allocPrint(ctx.allocator, "ETag: \"{s}\"", .{meta.etag}) catch "") catch {};
+    if (vstate != .disabled) {
+        hdrs_list.append(ctx.allocator, std.fmt.allocPrint(ctx.allocator, "x-amz-version-id: {s}", .{new_vid}) catch "") catch {};
+    }
     for (sse_info.resp_headers) |h| hdrs_list.append(ctx.allocator, h) catch {};
     return .{ .status = 200, .status_text = "OK", .extra_headers = hdrs_list.toOwnedSlice(ctx.allocator) catch &.{} };
 }
@@ -421,15 +522,52 @@ pub fn copyObject(ctx: HandlerContext, dst_bucket: []const u8, dst_key: []const 
 pub fn getObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: *http.Request) http.Response {
     if (ctx.cluster) |cr| return clusterGetObject(ctx, cr, bucket, key, req);
 
-    // ?versionId= — serve a specific historical snapshot.
+    // ?versionId= — serve a specific historical snapshot, or (for the
+    // sentinel "null") the current object when it *is* the null version.
+    var serving_null_version = false;
     if (qp(req.query, "versionId")) |vid| {
-        return getObjectVersion(ctx, bucket, key, vid);
+        if (std.mem.eql(u8, vid, "null")) {
+            var bd = ctx.data_dir.openDir(bucket, .{}) catch return errResp(ctx, 404, "Not Found", "NoSuchBucket", "Bucket missing", bucket);
+            defer bd.close();
+            const cur = storage.currentVersionId(bd, ctx.allocator, key) catch return internal(ctx, key);
+            defer ctx.allocator.free(cur);
+            if (!std.mem.eql(u8, cur, "null")) {
+                return errResp(ctx, 404, "Not Found", "NoSuchVersion", "Version not found", key);
+            }
+            serving_null_version = true;
+        } else {
+            return getObjectVersion(ctx, bucket, key, vid);
+        }
     }
 
     const opened = storage.openObject(ctx.data_dir, ctx.allocator, bucket, key) catch |e| return mapErr(ctx, e, key);
     var file = opened.file;
     const meta = opened.meta;
     const total: u64 = meta.size;
+
+    // Tiered object: the local file is a zero-byte stub (see tiering.zig).
+    // Fetch the real bytes from the cold target and spool them to a
+    // request-scoped temp file so the existing file-based body/range/decrypt
+    // machinery below works unchanged. ponytail: cold GET spools to temp
+    // file on every request; no local rehydration/cleanup policy yet.
+    if (meta.tiered) {
+        file.close();
+        const tc = ctx.tiering orelse return errResp(ctx, 500, "Internal Server Error", "InternalError", "Object is tiered but tiering is not configured", key);
+        const cold_bytes = tc.fetchCold(ctx.allocator, bucket, key) catch return errResp(ctx, 500, "Internal Server Error", "InternalError", "Failed to fetch tiered object", key);
+        defer ctx.allocator.free(cold_bytes);
+
+        var bd = ctx.data_dir.openDir(bucket, .{}) catch return errResp(ctx, 404, "Not Found", "NoSuchBucket", "Bucket missing", bucket);
+        defer bd.close();
+        bd.makePath(storage_paths.tmp_dir) catch {};
+        var rand_bytes: [12]u8 = undefined;
+        std.crypto.random.bytes(&rand_bytes);
+        var hex_buf: [24]u8 = undefined;
+        util.hexEncodeBuf(&rand_bytes, &hex_buf);
+        var tmp_name_buf: [96]u8 = undefined;
+        const tmp_name = std.fmt.bufPrint(&tmp_name_buf, "{s}/cold-{s}", .{ storage_paths.tmp_dir, hex_buf }) catch return internal(ctx, key);
+        bd.writeFile(.{ .sub_path = tmp_name, .data = cold_bytes }) catch return internal(ctx, key);
+        file = bd.openFile(tmp_name, .{}) catch return internal(ctx, key);
+    }
 
     // Conditional headers.
     if (req.header("if-none-match")) |inm| {
@@ -531,6 +669,8 @@ pub fn getObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
         if (status == 206) {
             hdrs_list.append(a, std.fmt.allocPrint(a, "Content-Range: bytes {d}-{d}/{d}", .{ offset, offset + length - 1, total }) catch "") catch {};
         }
+        if (serving_null_version) hdrs_list.append(a, "x-amz-version-id: null") catch {};
+        if (meta.storage_class.len > 0) hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-storage-class: {s}", .{meta.storage_class}) catch "") catch {};
         for (sse_resp_hdrs.items) |h| hdrs_list.append(a, h) catch {};
 
         return .{
@@ -566,6 +706,8 @@ pub fn getObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
     if (status == 206) {
         hdrs_list.append(a, std.fmt.allocPrint(a, "Content-Range: bytes {d}-{d}/{d}", .{ offset, offset + length - 1, total }) catch "") catch {};
     }
+    if (serving_null_version) hdrs_list.append(a, "x-amz-version-id: null") catch {};
+    if (meta.storage_class.len > 0) hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-storage-class: {s}", .{meta.storage_class}) catch "") catch {};
     const hdrs = hdrs_list.toOwnedSlice(a) catch &.{};
 
     return .{
@@ -580,8 +722,20 @@ pub fn getObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
 pub fn headObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: *http.Request) http.Response {
     if (ctx.cluster) |cr| return clusterHeadObject(ctx, cr, bucket, key);
 
+    var serving_null_version = false;
     if (qp(req.query, "versionId")) |vid| {
-        return headObjectVersion(ctx, bucket, key, vid);
+        if (std.mem.eql(u8, vid, "null")) {
+            var bd = ctx.data_dir.openDir(bucket, .{}) catch return errResp(ctx, 404, "Not Found", "NoSuchBucket", "Bucket missing", bucket);
+            defer bd.close();
+            const cur = storage.currentVersionId(bd, ctx.allocator, key) catch return internal(ctx, key);
+            defer ctx.allocator.free(cur);
+            if (!std.mem.eql(u8, cur, "null")) {
+                return errResp(ctx, 404, "Not Found", "NoSuchVersion", "Version not found", key);
+            }
+            serving_null_version = true;
+        } else {
+            return headObjectVersion(ctx, bucket, key, vid);
+        }
     }
 
     const meta = storage.headObject(ctx.data_dir, ctx.allocator, bucket, key) catch |e| return mapErr(ctx, e, key);
@@ -594,6 +748,8 @@ pub fn headObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req:
     hdrs_list.append(a, std.fmt.allocPrint(a, "Last-Modified: {s}", .{lm}) catch "") catch {};
     // Override content-length so HEAD reports object size, not 0 body.
     hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-actual-length: {d}", .{meta.size}) catch "") catch {};
+    if (serving_null_version) hdrs_list.append(a, "x-amz-version-id: null") catch {};
+    if (meta.storage_class.len > 0) hdrs_list.append(a, std.fmt.allocPrint(a, "x-amz-storage-class: {s}", .{meta.storage_class}) catch "") catch {};
 
     if (meta.encryption) |enc| {
         if (std.mem.eql(u8, enc.alg, "SSE-C")) {
@@ -619,10 +775,32 @@ pub fn headObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req:
 pub fn deleteObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: *http.Request) http.Response {
     if (ctx.cluster) |cr| return clusterDeleteObject(ctx, cr, bucket, key);
 
-    // ?versionId= — permanently delete that specific snapshot.
+    // ?versionId= — permanently delete that specific version. The sentinel
+    // "null" addresses the current object *iff* it is the tracked null
+    // version (nulls are never snapshotted, so there's nowhere else to look).
     if (qp(req.query, "versionId")) |vid| {
         var bd = ctx.data_dir.openDir(bucket, .{}) catch return errResp(ctx, 404, "Not Found", "NoSuchBucket", "Bucket missing", bucket);
         defer bd.close();
+        if (std.mem.eql(u8, vid, "null")) {
+            const cur = storage.currentVersionId(bd, ctx.allocator, key) catch return internal(ctx, key);
+            defer ctx.allocator.free(cur);
+            if (!std.mem.eql(u8, cur, "null")) {
+                return errResp(ctx, 404, "Not Found", "NoSuchVersion", "Version not found", key);
+            }
+            storage.deleteObject(ctx.data_dir, ctx.allocator, bucket, key) catch |e| switch (e) {
+                error.ObjectNotFound => {},
+                else => return mapErr(ctx, e, key),
+            };
+            storage.deleteCurrentVersionIdSidecar(bd, ctx.allocator, key);
+            if (ctx.cluster == null) {
+                if (ctx.index) |ix| ix.noteDelete(bucket, key);
+            }
+            if (ctx.notifier) |n| {
+                n.fire(.{ .bucket = bucket, .key = key, .name = .removed_delete, .size = 0, .etag = "" });
+            }
+            const hdrs = ctx.allocator.dupe([]const u8, &.{"x-amz-version-id: null"}) catch &.{};
+            return .{ .status = 204, .status_text = "No Content", .extra_headers = hdrs };
+        }
         storage.deleteObjectVersion(bd, ctx.allocator, key, vid) catch |e| return mapErr(ctx, e, key);
         const vid_hdr = std.fmt.allocPrint(ctx.allocator, "x-amz-version-id: {s}", .{vid}) catch "";
         const hdrs = ctx.allocator.dupe([]const u8, &.{vid_hdr}) catch &.{};
@@ -633,15 +811,17 @@ pub fn deleteObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, re
         return errResp(ctx, 403, "Forbidden", "AccessDenied", "Object is WORM-protected (retention or legal hold)", key);
     }
 
-    // If versioning is enabled, snapshot then write a delete marker instead
-    // of physically removing the current object.
     const vstate = storage.getBucketVersioning(ctx.data_dir, bucket) catch .disabled;
+
+    // Enabled: snapshot the current object aside (it becomes noncurrent),
+    // then write a fresh-vid delete marker as the new current entry.
     if (vstate == .enabled) {
         snapshotIfVersioned(ctx, bucket, key);
         var bd = ctx.data_dir.openDir(bucket, .{}) catch return errResp(ctx, 404, "Not Found", "NoSuchBucket", "Bucket missing", bucket);
         defer bd.close();
         const vid = storage.addDeleteMarker(bd, ctx.allocator, key) catch |e| return mapErr(ctx, e, key);
         storage.deleteObject(ctx.data_dir, ctx.allocator, bucket, key) catch {};
+        storage.deleteCurrentVersionIdSidecar(bd, ctx.allocator, key);
         // ponytail: index is single-node; cluster listing still walks.
         if (ctx.cluster == null) {
             if (ctx.index) |ix| ix.noteDelete(bucket, key);
@@ -655,7 +835,29 @@ pub fn deleteObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, re
         return .{ .status = 204, .status_text = "No Content", .extra_headers = hdrs };
     }
 
-    snapshotIfVersioned(ctx, bucket, key);
+    // Suspended: the current object *is* the null version — deleting it adds
+    // (or replaces in place) a null delete marker and removes the null
+    // version's data. Nulls are never preserved as noncurrent snapshots.
+    if (vstate == .suspended) {
+        var bd = ctx.data_dir.openDir(bucket, .{}) catch return errResp(ctx, 404, "Not Found", "NoSuchBucket", "Bucket missing", bucket);
+        defer bd.close();
+        storage.setNullDeleteMarker(bd, ctx.allocator, key) catch |e| return mapErr(ctx, e, key);
+        storage.deleteObject(ctx.data_dir, ctx.allocator, bucket, key) catch |e| switch (e) {
+            error.ObjectNotFound => {},
+            else => return mapErr(ctx, e, key),
+        };
+        storage.deleteCurrentVersionIdSidecar(bd, ctx.allocator, key);
+        if (ctx.cluster == null) {
+            if (ctx.index) |ix| ix.noteDelete(bucket, key);
+        }
+        if (ctx.notifier) |n| {
+            n.fire(.{ .bucket = bucket, .key = key, .name = .removed_delete_marker, .size = 0, .etag = "" });
+        }
+        const dm_hdr = std.fmt.allocPrint(ctx.allocator, "x-amz-delete-marker: true", .{}) catch "";
+        const hdrs = ctx.allocator.dupe([]const u8, &.{ "x-amz-version-id: null", dm_hdr }) catch &.{};
+        return .{ .status = 204, .status_text = "No Content", .extra_headers = hdrs };
+    }
+
     storage.deleteObject(ctx.data_dir, ctx.allocator, bucket, key) catch |e| switch (e) {
         error.ObjectNotFound => {}, // S3 returns 204 even if missing.
         else => return mapErr(ctx, e, key),
@@ -675,7 +877,13 @@ fn snapshotIfVersioned(ctx: HandlerContext, bucket: []const u8, key: []const u8)
     if (state != .enabled) return;
     var bd = ctx.data_dir.openDir(bucket, .{}) catch return;
     defer bd.close();
-    _ = storage.snapshotCurrentVersion(bd, ctx.allocator, key) catch return;
+    // Preserve the outgoing object's own tracked vid as the archive slot id
+    // (continuity with any x-amz-version-id previously returned for it); a
+    // "null" outgoing vid gets a freshly minted archive id instead.
+    const cur_vid = storage.currentVersionId(bd, ctx.allocator, key) catch null;
+    defer if (cur_vid) |v| ctx.allocator.free(v);
+    const hint: ?[]const u8 = if (cur_vid) |v| (if (std.mem.eql(u8, v, "null")) null else v) else null;
+    _ = storage.snapshotCurrentVersion(bd, ctx.allocator, key, hint) catch return;
 }
 
 fn objectIsCurrentlyProtectedNoReq(ctx: HandlerContext, bucket: []const u8, key: []const u8, bypass: bool) bool {
@@ -740,6 +948,7 @@ pub fn listObjectVersions(ctx: HandlerContext, bucket: []const u8, req: *http.Re
         for (entries) |e| {
             ctx.allocator.free(e.key);
             ctx.allocator.free(e.etag);
+            ctx.allocator.free(e.version_id);
         }
         ctx.allocator.free(entries);
     }
@@ -754,7 +963,7 @@ pub fn listObjectVersions(ctx: HandlerContext, bucket: []const u8, req: *http.Re
         const lm = util.formatIso8601(&lm_bufs.items[idx], e.mtime_ns);
         infos.append(ctx.allocator, .{
             .key = e.key,
-            .version_id = &e.version_id,
+            .version_id = e.version_id,
             .is_delete_marker = e.is_delete_marker,
             .is_latest = e.is_latest,
             .last_modified = lm,

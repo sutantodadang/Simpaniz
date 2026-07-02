@@ -11,6 +11,7 @@ const http = @import("http.zig");
 const index_html = @embedFile("ui_assets/index.html");
 const style_css = @embedFile("ui_assets/style.css");
 const app_js = @embedFile("ui_assets/app.js");
+const dashboard_js = @embedFile("ui_assets/dashboard.js");
 
 /// True if `path` is owned by the web console and should bypass S3 routing.
 pub fn matches(path: []const u8) bool {
@@ -30,6 +31,9 @@ pub fn serve(path: []const u8) http.Response {
     }
     if (std.mem.eql(u8, path, "/console/app.js")) {
         return staticAsset("application/javascript; charset=utf-8", app_js);
+    }
+    if (std.mem.eql(u8, path, "/console/dashboard.js")) {
+        return staticAsset("application/javascript; charset=utf-8", dashboard_js);
     }
     return .{
         .status = 404,
@@ -67,4 +71,7 @@ test "serve returns assets" {
 
     const r3 = serve("/console/missing");
     try std.testing.expectEqual(@as(u16, 404), r3.status);
+
+    const r4 = serve("/console/dashboard.js");
+    try std.testing.expectEqual(@as(u16, 200), r4.status);
 }

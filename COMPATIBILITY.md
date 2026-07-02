@@ -19,8 +19,8 @@ Status legend:
 | `GetBucketPolicy` / `PutBucketPolicy` / `DeleteBucketPolicy` | ✅ | Stored as raw JSON; **enforced** on every request (explicit Deny wins, then Allow, default-deny for authenticated non-root users). Root bypasses. |
 | `PutBucketNotificationConfiguration` / `GetBucketNotificationConfiguration` | ✅ | XML `<Event>` patterns (e.g. `s3:ObjectCreated:*`) + prefix/suffix `FilterRule`s. Requires `SIMPANIZ_NOTIFY_WEBHOOK` to actually deliver. |
 | `PutBucketEncryption` / `GetBucketEncryption` / `DeleteBucketEncryption` | ✅ | Default SSE (AES256 or aws:kms) applied to PUTs that don't override it. |
-| `GetBucketVersioning` / `PutBucketVersioning` | ⚠️ | `Enabled` / `Suspended` honoured. PUT snapshots the prior version under `.simpaniz-versions/`. `?versionId=` GET/HEAD/DELETE supported. `ListObjectVersions` (`GET ?versions`) returns versions and delete markers. Delete markers are written when versioning is enabled and `DELETE` arrives without `?versionId=`. `Suspended` semantics on overwrite still TODO. |
-| `GetBucketLifecycle` / `PutBucketLifecycle` / `DeleteBucketLifecycle` | ⚠️ | XML stored verbatim. Background sweeper expires objects matching `<Prefix>` older than `<Days>` when `SIMPANIZ_LIFECYCLE_INTERVAL_S` > 0. Transitions, `<NoncurrentVersionExpiration>`, and tag filters are not implemented. |
+| `GetBucketVersioning` / `PutBucketVersioning` | ✅ | `Enabled` / `Suspended` honoured. PUT snapshots the prior version under `.simpaniz-versions/`. `?versionId=` GET/HEAD/DELETE supported, including `?versionId=null`. `ListObjectVersions` (`GET ?versions`) returns versions and delete markers with correct IsLatest/newest-first ordering (live object pinned). Delete markers are written when versioning is enabled and `DELETE` arrives without `?versionId=`. `Suspended` overwrite is in-place on the null version (S3 null-version semantics), including null delete markers. `x-amz-version-id` returned on PUT. |
+| `GetBucketLifecycle` / `PutBucketLifecycle` / `DeleteBucketLifecycle` | ✅ | XML stored verbatim. Background sweeper expires objects matching `<Prefix>` older than `<Days>` when `SIMPANIZ_LIFECYCLE_INTERVAL_S` > 0. `<NoncurrentVersionExpiration>` expires noncurrent versions N days after becoming noncurrent. `<Filter>` tag filters (single `<Tag>`, incl. inside `<And>`). `<Transition>` (Days + StorageClass) drives tiering — see Object operations below. |
 
 ## Object operations
 
@@ -38,10 +38,11 @@ Status legend:
 | `ListObjectsV2`                            |   ✅   | `prefix`, `delimiter`, `max-keys`, `continuation-token`, `start-after`, `CommonPrefixes`. Single-node listing served from a metadata index (`index.zig`) with flat memory; continuation-token pagination is loss-free (fixed a bug where the boundary key was dropped on truncated pages). |
 | `ListObjects` (v1)                         |   ⚠️  | Routes to the same handler; `marker` ≈ `start-after`.     |
 | Object tags (`PutObjectTagging` / `GetObjectTagging` / `DeleteObjectTagging`) | ✅ | Stored as XML next to object metadata. |
-| Object Lock / Legal Hold                   |   ⚠️  | Per-object retention (`PutObjectRetention`/`GetObjectRetention`) and legal hold (`PutObjectLegalHold`/`GetObjectLegalHold`) implemented. `DELETE`/overwrite returns `403 AccessDenied` while protected. `GOVERNANCE` may be bypassed with `x-amz-bypass-governance-retention: true`. Bucket-level default retention not yet stored. |
+| Object Lock / Legal Hold                   |   ✅  | Per-object retention (`PutObjectRetention`/`GetObjectRetention`) and legal hold (`PutObjectLegalHold`/`GetObjectLegalHold`) implemented. `DELETE`/overwrite returns `403 AccessDenied` while protected. `GOVERNANCE` may be bypassed with `x-amz-bypass-governance-retention: true`. Bucket-level default retention is stored and applied to every PUT (`object_lock_config.zig`, `handlers.applyDefaultRetention`). |
 | Bitrot scrubber                            |   ✅   | Background MD5 re-verification when `SIMPANIZ_SCRUB_INTERVAL_S` > 0. Surfaces failures via `simpaniz_bitrot_errors_total` and warn-level logs. |
 | Object ACLs                                |   ❌   | All-or-nothing access via SigV4.                          |
-| SSE-S3 (`x-amz-server-side-encryption: AES256`) | ✅ | AES-256-GCM, chunked (64 KiB), per-object DEK wrapped under `SIMPANIZ_MASTER_KEY`. Supported on single PUT/GET, multipart, copy-source, default-bucket-encryption, and `Range` GET. |
+| Storage class / tiering (`x-amz-storage-class`) | ✅ | Lifecycle `<Transition>` moves cold objects to `SIMPANIZ_TIER_DIR` (local) or a SigV4-signed remote S3-compatible target (`SIMPANIZ_TIER_URL`/`_BUCKET`/`_ACCESS_KEY`/`_SECRET_KEY`); local file becomes a stub. GET/HEAD transparently re-fetch from cold (spooled to a temp file) — the client sees no difference. `x-amz-storage-class` echoed. No native GCS/Azure backend, no rehydration policy. |
+| SSE-S3 (`x-amz-server-side-encryption: AES256`) | ✅ | AES-256-GCM, chunked (64 KiB), per-object DEK wrapped under `SIMPANIZ_MASTER_KEY`. Supported on single PUT/GET, multipart, copy-source, default-bucket-encryption, and `Range` GET. Composes with tiering — cold storage holds the same on-disk ciphertext. |
 | SSE-C (customer-provided key)              |   ✅   | Customer key supplied via request headers, MD5-validated, never persisted server-side. |
 | SSE-KMS (`aws:kms`)                        |   ✅   | Local keyring (master-key wrap under `SIMPANIZ_MASTER_KEY`), not an external/pluggable KMS. Response echoes alg `aws:kms` + key-id. |
 
@@ -65,9 +66,16 @@ Status legend:
 | AWS Signature V4 — header form             |   ✅   |                                                          |
 | AWS Signature V4 — presigned URL           |   ✅   |                                                          |
 | AWS Signature V2                           |   ❌   | Deprecated by AWS; not implemented.                       |
-| `STS:AssumeRole` etc.                      |   ❌   |                                                          |
+| `STS:AssumeRole`                           |   ✅   | SigV4-signed, query-param API. Temp creds (`x-amz-security-token`), optional session `Policy` (intersects base permissions, gates root too), 900–43200 s duration. |
+| `STS:AssumeRoleWithWebIdentity`            |   ✅   | Unsigned, query-param API. OIDC JWT verified: ES256 fully, RS256 via bigint modexp. JWKS from `SIMPANIZ_OIDC_JWKS_URL`, issuer/audience checked, policy claim maps to a named policy file (`.simpaniz-iam/policies/`), optional default policy. Temp creds are in-memory only — a restart invalidates them. Form-body request not parsed (query params only). |
 | Anonymous mode                             |   ✅   | When no credentials configured. Default-allow unless a bucket policy denies. |
-| Multi-user IAM + policy enforcement        |   ✅   | `<DATA_DIR>/.simpaniz-iam/users.json`. Bucket + inline user policies (Effect/Action/Resource/Principal/Condition) enforced after SigV4 verify. |
+| Multi-user IAM + policy enforcement        |   ✅   | `<DATA_DIR>/.simpaniz-iam/users.json`, hot-editable. Bucket + inline user policies (Effect/Action/Resource/Principal/Condition) enforced after SigV4 verify. |
+
+## Admin API
+
+| Operation                                  | Status | Notes                                                    |
+| ------------------------------------------ | :----: | -------------------------------------------------------- |
+| `/_admin/*` (info, users, policies, cluster, config) | ✅ | **Simpaniz-specific, not part of the S3 API.** Root-only REST; sanitized config/never returns secrets. `simpaniz admin <cmd>` ships in the same binary as the server (SigV4-signed client), unlike MinIO's separate `mc`. |
 
 ## Routing
 
@@ -83,6 +91,7 @@ Status legend:
 | `/healthz`                                 |   ✅   | Liveness — server is up.                                  |
 | `/readyz`                                  |   ✅   | Readiness — data dir writable.                            |
 | `/metrics`                                 |   ✅   | Prometheus text-exposition format.                        |
+| `/console/` + `/_dashboard/api/{summary,series}` | ✅ | Built-in web console Metrics tab: canvas charts (req/err rate, latency percentiles, throughput, in-flight), summary cards, cluster node states. SigV4-authenticated, in-process 24h history (`SIMPANIZ_METRICS_SAMPLE_S`), no Prometheus/Grafana needed. |
 | Structured JSON access log                 |   ✅   | One line per request.                                     |
 | `x-amz-request-id` header                  |   ✅   | Per-request 32-hex-char id.                               |
 
