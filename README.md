@@ -186,7 +186,17 @@ simpaniz admin info
 simpaniz admin user add alice s3cr3t --policy ./read-only.json
 simpaniz admin policy set read-only ./read-only.json
 simpaniz admin cluster
+simpaniz admin cluster decommission node-3
 ```
+
+`cluster decommission <node-id>` (`POST /_admin/cluster/decommission?node=<id>`,
+root-only) marks a node `draining`: it stays a read source while the
+rebalance daemon migrates its shards to the remaining nodes, then it
+auto-promotes to `removed` and drops out of the persisted peer overlay once
+empty. Can be issued against any node in the cluster — the decision
+gossips to the rest, including the target. `simpaniz admin cluster` (and
+`GET /_admin/cluster`) reports each node's state, including `draining`/
+`removed`.
 
 ## Usage examples
 

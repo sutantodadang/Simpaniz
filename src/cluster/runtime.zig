@@ -171,7 +171,10 @@ pub const ClusterRuntime = struct {
         const k_plus_m = self.config.shardCount();
         if (k_plus_m > placement_buf.len) return error.TooManyShards;
         const placement = placement_buf[0..k_plus_m];
-        try self.orchestrator.placement(bucket, key, placement);
+        // Meta must land on the SAME nodes the shard data does — use
+        // write-placement (excludes draining/removed nodes), matching
+        // `Orchestrator.put`'s target set.
+        try self.orchestrator.writePlacement(bucket, key, placement);
 
         var ok_count: usize = 0;
         for (placement) |node| {

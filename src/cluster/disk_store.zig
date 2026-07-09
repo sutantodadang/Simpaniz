@@ -215,6 +215,25 @@ pub fn forEachLocalKey(
     }
 }
 
+/// True if this node currently holds at least one local shard file
+/// (`.simpaniz-shards/**/*.shard`). Used by the rebalance sweep to decide
+/// whether a `draining` node has finished emptying out and can be promoted
+/// to `removed`.
+pub fn hasAnyLocalShard(data_dir: std.fs.Dir, allocator: Allocator) !bool {
+    var shards_dir = data_dir.openDir(shards_root, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return false,
+        else => return e,
+    };
+    defer shards_dir.close();
+    var walker = try shards_dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.path, ".shard")) return true;
+    }
+    return false;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 test "shard round-trip" {

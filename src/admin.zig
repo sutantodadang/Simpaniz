@@ -36,6 +36,7 @@ pub fn handle(ctx: HandlerContext, req: *http.Request) http.Response {
         return policyItem(ctx, req, path["/_admin/policies/".len..]);
     }
     if (std.mem.eql(u8, path, "/_admin/cluster")) return clusterInfo(ctx, req);
+    if (std.mem.eql(u8, path, "/_admin/cluster/decommission")) return decommission(ctx, req);
     if (std.mem.eql(u8, path, "/_admin/config")) return configInfo(ctx, req);
 
     return jsonErr(ctx, 404, "Not Found", "NotFound", "No such admin endpoint.");
@@ -184,6 +185,45 @@ fn clusterInfo(ctx: HandlerContext, req: *http.Request) http.Response {
         .{ cr.config.node_id, cr.config.ec_k, cr.config.ec_m, membership_json },
     ) catch return internalErr(ctx);
     return .{ .status = 200, .status_text = "OK", .content_type = "application/json", .body = .{ .bytes = body } };
+}
+
+// ── /_admin/cluster/decommission ────────────────────────────────────────────
+
+/// `POST /_admin/cluster/decommission?node=<id>` — mark `node` `draining`.
+/// The receiving node applies this to its OWN local membership view (so an
+/// admin can hit any node in the cluster, not just the target); gossip
+/// (`Membership.mergeGossip`, see the `draining`/`removed` precedence rules
+/// there) propagates the decision to every other node, including the
+/// target itself, which then reacts by sweeping its own shards off and
+/// auto-promoting to `removed` once empty (see `rebalance.runOnceDraining`).
+fn decommission(ctx: HandlerContext, req: *http.Request) http.Response {
+    if (req.method != .POST) return methodNotAllowed(ctx);
+    const cr = ctx.cluster orelse return jsonErr(ctx, 409, "Conflict", "ClusterDisabled", "Cluster mode is not enabled.");
+    const node_id = qp(req.query, "node") orelse return jsonErr(ctx, 400, "Bad Request", "InvalidArgument", "Missing node query parameter.");
+    if (node_id.len == 0) return jsonErr(ctx, 400, "Bad Request", "InvalidArgument", "Missing node query parameter.");
+
+    cr.membership.markDraining(node_id) catch {
+        return jsonErr(ctx, 400, "Bad Request", "NoSuchNode", "Unknown node id.");
+    };
+
+    const Resp = struct { status: []const u8, node: []const u8 };
+    return jsonOk(ctx, Resp{ .status = "draining", .node = node_id });
+}
+
+/// Find `name=value` in a raw (undecoded) query string joined by `&`.
+/// Duplicated from `handlers.zig`'s private `qp` — small enough (and this
+/// module doesn't otherwise depend on `handlers.zig`'s internals) that
+/// exporting it there isn't worth the coupling.
+fn qp(query: []const u8, key: []const u8) ?[]const u8 {
+    var iter = std.mem.splitScalar(u8, query, '&');
+    while (iter.next()) |param| {
+        if (std.mem.indexOfScalar(u8, param, '=')) |eq| {
+            if (std.mem.eql(u8, param[0..eq], key)) return param[eq + 1 ..];
+        } else if (std.mem.eql(u8, param, key)) {
+            return "";
+        }
+    }
+    return null;
 }
 
 // ── /_admin/config ───────────────────────────────────────────────────────────
@@ -443,4 +483,21 @@ test "policy PUT/GET round-trip; invalid JSON rejected with 400" {
         try std.testing.expectEqual(@as(u16, 200), get_resp.status);
         try std.testing.expect(std.mem.indexOf(u8, get_resp.body.bytes, "Statement") != null);
     }
+}
+
+test "decommission: 409 when cluster mode is off" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = iam.Store{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .users = &.{} };
+    defer store.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx = testCtx(tmp.dir, &store, .{ .access_key = "root", .is_root = true }, arena.allocator());
+
+    var fbs = std.Io.Reader.fixed("POST /_admin/cluster/decommission?node=n1 HTTP/1.1\r\nHost: h\r\n\r\n");
+    var req = try http.parseRequest(&fbs, std.testing.allocator, .{});
+    defer req.deinit();
+    const resp = handle(ctx, &req);
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
 }
