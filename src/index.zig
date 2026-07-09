@@ -457,12 +457,16 @@ fn segmentSeekPeek(seg: *const Segment, gpa: Allocator, bound: []const u8, inclu
     }
 }
 
+/// Result shape shared by every bootstrap metadata reader (see
+/// `BootstrapSource` below).
+pub const MetaVals = struct { size: u64, mtime_ns: i128, etag: []const u8 };
+
 /// Bootstrap-time / test-time object metadata lookup: mirrors
 /// `storage/objects.zig:listObjects` (lines ~428-448) exactly, including its
 /// quirk of reporting the live filesystem stat (size/mtime) rather than the
 /// metadata sidecar's recorded values, so a full rebuild is byte-for-byte
 /// equivalent to the old FS-walk listing.
-fn readObjectMetaForIndex(bucket_dir: Dir, gpa: Allocator, key: []const u8) !struct { size: u64, mtime_ns: i128, etag: []const u8 } {
+fn readObjectMetaForIndex(bucket_dir: Dir, gpa: Allocator, key: []const u8) !MetaVals {
     const stat = try bucket_dir.statFile(key);
     const meta = internal.readMetadata(bucket_dir, gpa, key) catch {
         return .{ .size = stat.size, .mtime_ns = stat.mtime, .etag = try gpa.dupe(u8, "unknown") };
@@ -477,6 +481,22 @@ fn readObjectMetaForIndex(bucket_dir: Dir, gpa: Allocator, key: []const u8) !str
     }
     return .{ .size = stat.size, .mtime_ns = stat.mtime, .etag = meta.etag };
 }
+
+/// Pluggable bootstrap FS-walk source: lets a caller other than the
+/// single-node object layout populate a bucket's index from its own on-disk
+/// representation. Used by `src/cluster/list_index.zig` to bootstrap from
+/// `.simpaniz-meta/<bucket>/<key>.meta` JSON sidecars instead of real S3
+/// object files.
+///
+/// `key_suffix`, when set, is stripped from every walked file's relative
+/// path to produce the emitted logical key (files not ending in the suffix
+/// are skipped); `null` means "the file path IS the key" (single-node
+/// layout, the default). `read` receives the *raw* on-disk relative path
+/// (before suffix-stripping) so it can re-open the exact file.
+pub const BootstrapSource = struct {
+    key_suffix: ?[]const u8 = null,
+    read: *const fn (bucket_dir: Dir, gpa: Allocator, path: []const u8) anyerror!MetaVals = readObjectMetaForIndex,
+};
 
 // ── BucketIndex: per-bucket LSM-lite state. ──
 
@@ -843,7 +863,12 @@ const BucketIndex = struct {
 /// Full FS walk + sort, mirroring `storage/objects.zig:listObjects`'s
 /// collection phase, then a single streamed write into segment #1. Used
 /// both for first-ever indexing and for self-healing after corruption.
-fn bootstrapBuild(gpa: Allocator, bucket_dir: Dir, threshold: usize) !BucketIndex {
+///
+/// `source` selects how on-disk files map to logical keys and how their
+/// size/mtime/etag are read (see `BootstrapSource`); defaults to the
+/// single-node object layout, so `source = .{}` reproduces the previous
+/// behavior byte-for-byte.
+fn bootstrapBuild(gpa: Allocator, bucket_dir: Dir, threshold: usize, source: BootstrapSource) !BucketIndex {
     bucket_dir.makeDir(index_dir_name) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
@@ -851,9 +876,10 @@ fn bootstrapBuild(gpa: Allocator, bucket_dir: Dir, threshold: usize) !BucketInde
     var idx_dir = try bucket_dir.openDir(index_dir_name, .{ .iterate = true });
     errdefer idx_dir.close();
 
-    var all = std.ArrayList([]u8){};
+    const Item = struct { path: []u8, key: []const u8 };
+    var all = std.ArrayList(Item){};
     defer {
-        for (all.items) |k| gpa.free(k);
+        for (all.items) |it| gpa.free(it.path);
         all.deinit(gpa);
     }
 
@@ -867,12 +893,20 @@ fn bootstrapBuild(gpa: Allocator, bucket_dir: Dir, threshold: usize) !BucketInde
             for (normalized) |*c| if (c.* == '\\') {
                 c.* = '/';
             };
-            try all.append(gpa, normalized);
+            var key: []const u8 = normalized;
+            if (source.key_suffix) |suf| {
+                if (!std.mem.endsWith(u8, normalized, suf)) {
+                    gpa.free(normalized);
+                    continue;
+                }
+                key = normalized[0 .. normalized.len - suf.len];
+            }
+            try all.append(gpa, .{ .path = normalized, .key = key });
         }
     }
-    std.mem.sort([]u8, all.items, {}, struct {
-        fn lt(_: void, a: []u8, b: []u8) bool {
-            return std.mem.lessThan(u8, a, b);
+    std.mem.sort(Item, all.items, {}, struct {
+        fn lt(_: void, a: Item, b: Item) bool {
+            return std.mem.lessThan(u8, a.key, b.key);
         }
     }.lt);
 
@@ -894,10 +928,10 @@ fn bootstrapBuild(gpa: Allocator, bucket_dir: Dir, threshold: usize) !BucketInde
     var count: u64 = 0;
     var offset: u64 = 12;
 
-    for (all.items) |key| {
-        const m = readObjectMetaForIndex(bucket_dir, gpa, key) catch continue;
+    for (all.items) |item| {
+        const m = source.read(bucket_dir, gpa, item.path) catch continue;
         defer gpa.free(m.etag);
-        try writeRecordAndTrack(w, gpa, &footer, &count, &offset, key, m.size, m.mtime_ns, m.etag);
+        try writeRecordAndTrack(w, gpa, &footer, &count, &offset, item.key, m.size, m.mtime_ns, m.etag);
     }
 
     try writeSegTrailer(w, &footer, offset);
@@ -1013,7 +1047,7 @@ fn tryOpenExisting(gpa: Allocator, bucket_dir: Dir, threshold: usize) !BucketInd
     };
 }
 
-fn openOrBootstrap(gpa: Allocator, data_dir: Dir, bucket: []const u8, threshold: usize) !BucketIndex {
+fn openOrBootstrap(gpa: Allocator, data_dir: Dir, bucket: []const u8, threshold: usize, source: BootstrapSource) !BucketIndex {
     var bucket_dir = try data_dir.openDir(bucket, .{ .iterate = true });
     errdefer bucket_dir.close();
 
@@ -1022,7 +1056,7 @@ fn openOrBootstrap(gpa: Allocator, data_dir: Dir, bucket: []const u8, threshold:
     } else |err| {
         std.log.info("index: (re)building bucket={s} reason={s}", .{ bucket, @errorName(err) });
         bucket_dir.deleteTree(index_dir_name) catch {};
-        return bootstrapBuild(gpa, bucket_dir, threshold);
+        return bootstrapBuild(gpa, bucket_dir, threshold, source);
     }
 }
 
@@ -1036,9 +1070,20 @@ pub const Manager = struct {
     /// Overlay size (entry count) at which a bucket auto-compacts. Public
     /// and mutable so tests can force frequent compaction.
     compact_threshold: usize = compact_threshold_default,
+    /// How a never-before-seen bucket's index gets bootstrapped from disk.
+    /// Defaults to the single-node object layout (`.{}`); cluster mode uses
+    /// `initWithSource` to plug in `list_index.zig`'s cluster-meta adapter.
+    bootstrap_source: BootstrapSource = .{},
 
     pub fn init(gpa: Allocator, data_dir: Dir) Manager {
         return .{ .gpa = gpa, .data_dir = data_dir, .buckets = std.StringHashMap(*BucketIndex).init(gpa) };
+    }
+
+    /// Like `init`, but with a non-default `BootstrapSource` — used by
+    /// cluster mode to index `.simpaniz-meta/<bucket>/<key>.meta` JSON
+    /// sidecars instead of real object files.
+    pub fn initWithSource(gpa: Allocator, data_dir: Dir, source: BootstrapSource) Manager {
+        return .{ .gpa = gpa, .data_dir = data_dir, .buckets = std.StringHashMap(*BucketIndex).init(gpa), .bootstrap_source = source };
     }
 
     pub fn deinit(self: *Manager) void {
@@ -1058,7 +1103,7 @@ pub const Manager = struct {
 
         const bi = try self.gpa.create(BucketIndex);
         errdefer self.gpa.destroy(bi);
-        bi.* = try openOrBootstrap(self.gpa, self.data_dir, bucket, self.compact_threshold);
+        bi.* = try openOrBootstrap(self.gpa, self.data_dir, bucket, self.compact_threshold, self.bootstrap_source);
         errdefer bi.deinit();
 
         const key_owned = try self.gpa.dupe(u8, bucket);
@@ -1237,7 +1282,11 @@ fn expectPagesEqual(a: Allocator, data_dir: Dir, mgr: *Manager, bucket: []const 
     return totals;
 }
 
-fn freePage(a: Allocator, p: ListPage) void {
+/// Frees a `ListPage`'s owned strings and slices. Exposed (not just
+/// test-local) so callers outside this module — e.g. `list_index.zig`'s
+/// tests — that use a non-arena allocator can clean up a `Manager.list()`
+/// result correctly. Also frees `common_prefixes`' owned key strings.
+pub fn freePage(a: Allocator, p: ListPage) void {
     for (p.objects) |o| {
         a.free(o.key);
         a.free(o.last_modified);

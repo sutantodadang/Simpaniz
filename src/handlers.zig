@@ -153,17 +153,42 @@ pub fn listObjects(ctx: HandlerContext, bucket: []const u8, query: []const u8) h
         .max_keys = max_keys,
     };
 
-    // ponytail: index is single-node; cluster listing still walks.
+    // Cluster mode: index-backed, cluster-wide listing — merges every
+    // usable node's local sorted meta-key page (see
+    // `cluster/list_merge.zig`). A peer failing (twice, after one retry)
+    // fails the whole request with 500 rather than silently returning a
+    // partial listing — S3-correct, and matches the "never partial" design
+    // constraint for cluster listing.
+    if (ctx.cluster) |cr| {
+        const page = cr.listObjects(ctx.allocator, bucket, opts) catch |e| {
+            std.log.warn("cluster listObjects failed bucket={s} err={s}", .{ bucket, @errorName(e) });
+            return internal(ctx, bucket);
+        };
+        const body = xml.buildListObjects(ctx.allocator, .{
+            .bucket = bucket,
+            .prefix = dec_prefix,
+            .delimiter = dec_delim,
+            .continuation_token = dec_cont,
+            .next_continuation_token = page.next_continuation_token,
+            .start_after = dec_start,
+            .max_keys = max_keys,
+            .is_truncated = page.is_truncated,
+            .key_count = page.objects.len + page.common_prefixes.len,
+            .objects = page.objects,
+            .common_prefixes = page.common_prefixes,
+        }) catch return internal(ctx, bucket);
+        return .{ .status = 200, .status_text = "OK", .body = .{ .bytes = body } };
+    }
+
+    // Single-node: unchanged — index-backed with FS-walk fallback.
     var page: storage.ListPage = undefined;
     var used_index = false;
-    if (ctx.cluster == null) {
-        if (ctx.index) |ix| {
-            if (ix.list(ctx.allocator, bucket, opts)) |p| {
-                page = p;
-                used_index = true;
-            } else |e| {
-                std.log.warn("index: list failed bucket={s} err={s}, falling back to fs walk", .{ bucket, @errorName(e) });
-            }
+    if (ctx.index) |ix| {
+        if (ix.list(ctx.allocator, bucket, opts)) |p| {
+            page = p;
+            used_index = true;
+        } else |e| {
+            std.log.warn("index: list failed bucket={s} err={s}, falling back to fs walk", .{ bucket, @errorName(e) });
         }
     }
     if (!used_index) {
@@ -567,6 +592,14 @@ pub fn getObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
         const tmp_name = std.fmt.bufPrint(&tmp_name_buf, "{s}/cold-{s}", .{ storage_paths.tmp_dir, hex_buf }) catch return internal(ctx, key);
         bd.writeFile(.{ .sub_path = tmp_name, .data = cold_bytes }) catch return internal(ctx, key);
         file = bd.openFile(tmp_name, .{}) catch return internal(ctx, key);
+
+        // Optional rehydration: promote the object back to hot storage so
+        // future GETs skip the cold round trip. Best-effort — any failure
+        // is logged inside `rehydrate` and this GET still serves `file`
+        // (the spooled cold bytes) regardless of the outcome.
+        if (ctx.config) |cfg| {
+            if (cfg.tier_rehydrate) tc.rehydrate(bd, ctx.allocator, bucket, key, cold_bytes);
+        }
     }
 
     // Conditional headers.

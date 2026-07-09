@@ -92,11 +92,14 @@ pub const ServerContext = struct {
 // PEM / DER helpers
 // ---------------------------------------------------------------------------
 
-const PemBlock = struct { label: []const u8, der: []u8 };
+pub const PemBlock = struct { label: []const u8, der: []u8 };
 
 /// Decodes every `-----BEGIN X-----...-----END X-----` block in `text`. The
 /// `label` fields borrow from `text`; `der` fields are allocated via `a`.
-fn pemDecodeAll(a: Allocator, text: []const u8) ![]PemBlock {
+///
+/// Exported (in addition to internal use above) so `acme.zig` can reuse the
+/// same PEM/DER reading without duplicating it.
+pub fn pemDecodeAll(a: Allocator, text: []const u8) ![]PemBlock {
     var blocks = std.ArrayList(PemBlock){};
     errdefer {
         for (blocks.items) |b| a.free(b.der);
@@ -160,7 +163,9 @@ fn readTlv(buf: []const u8, pos: usize) error{InvalidPem}!Tlv {
 /// Extracts the raw 32-byte P-256 private scalar from either a PKCS#8
 /// `PrivateKeyInfo` (recurses once into the wrapped SEC1 `ECPrivateKey`) or a
 /// bare SEC1 `ECPrivateKey` DER blob.
-fn extractP256Scalar(der_bytes: []const u8) error{ InvalidPem, UnsupportedKey }![32]u8 {
+///
+/// Exported so `acme.zig` can reload the account/domain keys it persists.
+pub fn extractP256Scalar(der_bytes: []const u8) error{ InvalidPem, UnsupportedKey }![32]u8 {
     const outer = try readTlv(der_bytes, 0);
     if (outer.tag != 0x30) return error.UnsupportedKey; // SEQUENCE
     const content = outer.content;

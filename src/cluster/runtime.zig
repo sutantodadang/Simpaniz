@@ -16,43 +16,14 @@ const replication_mod = @import("replication.zig");
 pub const Replicator = replication_mod.Replicator;
 const membership_mod = @import("membership.zig");
 pub const Membership = membership_mod.Membership;
+const list_index_mod = @import("list_index.zig");
+const list_merge_mod = @import("list_merge.zig");
+const types = @import("../storage/types.zig");
 
-pub const ObjectMeta = struct {
-    shard_size: usize,
-    original_size: usize,
-    etag: [32]u8, // md5 hex (32 chars)
-    content_type: []const u8,
-    last_modified: i64, // unix seconds
-    encrypted: bool = false,
-
-    pub fn toJson(self: ObjectMeta, allocator: Allocator) ![]u8 {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"v\":1,\"shard_size\":{d},\"original_size\":{d},\"etag\":\"{s}\",\"content_type\":\"{s}\",\"last_modified\":{d},\"encrypted\":{}}}",
-            .{ self.shard_size, self.original_size, self.etag, self.content_type, self.last_modified, self.encrypted },
-        );
-    }
-
-    pub fn fromJson(allocator: Allocator, json: []const u8) !ObjectMeta {
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-        defer parsed.deinit();
-        const obj = parsed.value.object;
-        var m: ObjectMeta = .{
-            .shard_size = @intCast(obj.get("shard_size").?.integer),
-            .original_size = @intCast(obj.get("original_size").?.integer),
-            .etag = undefined,
-            .content_type = "",
-            .last_modified = obj.get("last_modified").?.integer,
-            .encrypted = if (obj.get("encrypted")) |v| v.bool else false,
-        };
-        const etag_s = obj.get("etag").?.string;
-        if (etag_s.len != 32) return error.BadMeta;
-        @memcpy(&m.etag, etag_s);
-        const ct = obj.get("content_type").?.string;
-        m.content_type = try allocator.dupe(u8, ct);
-        return m;
-    }
-};
+/// Re-exported from `disk_store.zig` (moved there so both this module and
+/// `list_index.zig` — the index-backed cluster-listing bootstrap adapter —
+/// can parse `.meta` JSON without an import cycle between the two).
+pub const ObjectMeta = disk.ObjectMeta;
 
 pub const ClusterRuntime = struct {
     allocator: Allocator,
@@ -69,6 +40,9 @@ pub const ClusterRuntime = struct {
     membership: *Membership,
     /// Cross-cluster replicator (null if no targets configured).
     replication: ?*Replicator = null,
+    /// This node's local LSM-lite listing index over `.simpaniz-meta`
+    /// (index-backed cluster listing — see `listObjects`/`list_merge.zig`).
+    list_index: list_index_mod.Index,
 
     pub fn init(allocator: Allocator, config: *ClusterConfig, data_dir: std.fs.Dir) !*ClusterRuntime {
         const rt = try allocator.create(ClusterRuntime);
@@ -82,6 +56,7 @@ pub const ClusterRuntime = struct {
             .orchestrator = undefined,
             .nodes = undefined,
             .membership = undefined,
+            .list_index = undefined,
         };
         rt.http_transport.metrics = &rt.metrics;
 
@@ -91,6 +66,10 @@ pub const ClusterRuntime = struct {
 
         rt.membership = try Membership.init(allocator, config, data_dir);
         errdefer rt.membership.deinit();
+
+        rt.list_index = try list_index_mod.Index.init(allocator, data_dir);
+        errdefer rt.list_index.deinit();
+        rt.http_transport.list_index = &rt.list_index;
 
         rt.orchestrator = try Orchestrator.init(
             allocator,
@@ -112,8 +91,19 @@ pub const ClusterRuntime = struct {
         }
         self.membership.deinit();
         self.orchestrator.deinit();
+        self.list_index.deinit();
         self.allocator.free(self.nodes);
         self.allocator.destroy(self);
+    }
+
+    /// Cluster-wide `ListObjectsV2`: merges every usable node's local sorted
+    /// meta-key page (via `HttpTransport.listMeta`, self-node short-
+    /// circuited to the local index) into one paginated result. See
+    /// `list_merge.zig` for the merge algorithm and its failure semantics
+    /// (a peer fetch failing twice fails the WHOLE request rather than
+    /// returning a partial listing).
+    pub fn listObjects(self: *ClusterRuntime, allocator: Allocator, bucket: []const u8, opts: types.ListOpts) !types.ListPage {
+        return list_merge_mod.merge(self.http_transport.transport(), self.membership, allocator, bucket, opts);
     }
 
     /// Start the membership health-probe thread. Safe to call once after
@@ -171,7 +161,10 @@ pub const ClusterRuntime = struct {
         const k_plus_m = self.config.shardCount();
         if (k_plus_m > placement_buf.len) return error.TooManyShards;
         const placement = placement_buf[0..k_plus_m];
-        try self.orchestrator.placement(bucket, key, placement);
+        // Meta must land on the SAME nodes the shard data does — use
+        // write-placement (excludes draining/removed nodes), matching
+        // `Orchestrator.put`'s target set.
+        try self.orchestrator.writePlacement(bucket, key, placement);
 
         var ok_count: usize = 0;
         for (placement) |node| {
@@ -226,23 +219,3 @@ pub const ClusterRuntime = struct {
         if (ok_count + @as(usize, self.config.ec_m) < total) return error.BucketReplicationQuorumFailed;
     }
 };
-
-test "ObjectMeta json round-trip" {
-    var m: ObjectMeta = .{
-        .shard_size = 1024,
-        .original_size = 4000,
-        .etag = "0123456789abcdef0123456789abcdef".*,
-        .content_type = "text/plain",
-        .last_modified = 1700000000,
-        .encrypted = false,
-    };
-    const j = try m.toJson(std.testing.allocator);
-    defer std.testing.allocator.free(j);
-
-    const round = try ObjectMeta.fromJson(std.testing.allocator, j);
-    defer std.testing.allocator.free(round.content_type);
-    try std.testing.expectEqual(m.shard_size, round.shard_size);
-    try std.testing.expectEqual(m.original_size, round.original_size);
-    try std.testing.expectEqualStrings(&m.etag, &round.etag);
-    try std.testing.expectEqualStrings(m.content_type, round.content_type);
-}

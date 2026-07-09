@@ -13,12 +13,24 @@
 //! full SWIM.
 //!
 //! Membership is index-stable and append-only: `nodes[i]` never changes
-//! identity and nodes are never removed (no decommission in v1 — a `down`
-//! node just stays `down` forever, or comes back `alive` on the next
+//! identity and entries are never removed from the in-memory array (a
+//! `down` node just stays `down` forever, or comes back `alive` on the next
 //! successful probe). This matters because shard placement indices
 //! (`rendezvous.pick` over node ids) must stay valid as long as the
 //! underlying id string is stable, and `Orchestrator.placement` reads the
 //! current node-id list through `Membership.snapshotIds` on every call.
+//!
+//! Decommission (`draining` -> `removed`) is layered on top without
+//! breaking that invariant: a `draining`/`removed` node's array slot never
+//! moves, it's just excluded from `Orchestrator.writePlacement`'s HRW
+//! candidate pool (see `placementIds`) so new writes and rebalance targets
+//! stop landing on it, while `placement` (the read path) is untouched so
+//! in-flight reads still find shards that haven't migrated off it yet.
+//! `draining`/`removed` are sticky: ordinary probe success/failure never
+//! flips them back to alive/suspect/down (see `recordProbeSuccess`/
+//! `recordProbeFailure`), and they gossip-propagate with
+//! `removed` > `draining` precedence over any other opinion (see
+//! `mergeGossip`).
 //!
 //! Newly joined nodes (beyond the statically configured `config.peers`)
 //! are persisted to `<data_dir>/.simpaniz-peers.json` so a restart doesn't
@@ -28,7 +40,7 @@ const Allocator = std.mem.Allocator;
 const config_mod = @import("config.zig");
 const ClusterConfig = config_mod.ClusterConfig;
 
-pub const NodeState = enum { alive, suspect, down };
+pub const NodeState = enum { alive, suspect, down, draining, removed };
 
 pub const NodeInfo = struct {
     id: []const u8, // owned
@@ -176,7 +188,41 @@ pub const Membership = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (idx >= self.nodes.items.len) return false;
-        return self.nodes.items[idx].state != .down;
+        return switch (self.nodes.items[idx].state) {
+            .down, .removed => false,
+            .alive, .suspect, .draining => true,
+        };
+    }
+
+    /// Id at index `idx`, or null if out of range. Independent of the
+    /// `self_index` this `Membership` was constructed with — used by the
+    /// rebalance sweep to resolve "my id" for a caller-chosen simulated
+    /// self-index (tests drive several simulated nodes through one shared
+    /// `Membership`).
+    pub fn idAt(self: *Membership, idx: usize) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (idx >= self.nodes.items.len) return null;
+        return self.nodes.items[idx].id;
+    }
+
+    /// Node ids eligible for WRITE placement: like `snapshotIds`, but
+    /// `draining`/`removed` nodes are excluded. `idx_buf[j]` is the TRUE
+    /// (index-stable) membership index of `id_buf[j]`, so a caller that
+    /// runs rendezvous hashing over the returned slice can translate the
+    /// local result index back to a real node index.
+    pub fn placementIds(self: *Membership, id_buf: [][]const u8, idx_buf: []usize) []const []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        for (self.nodes.items, 0..) |node, i| {
+            if (node.state == .draining or node.state == .removed) continue;
+            if (n >= id_buf.len) break;
+            id_buf[n] = node.id;
+            idx_buf[n] = i;
+            n += 1;
+        }
+        return id_buf[0..n];
     }
 
     pub fn stateOf(self: *Membership, idx: usize) NodeState {
@@ -231,6 +277,8 @@ pub const Membership = struct {
                 .alive => "alive",
                 .suspect => "suspect",
                 .down => "down",
+                .draining => "draining",
+                .removed => "removed",
             };
             const entry = try std.fmt.allocPrint(
                 alloc,
@@ -251,6 +299,9 @@ pub const Membership = struct {
         defer self.mutex.unlock();
         if (idx >= self.nodes.items.len) return;
         const n = &self.nodes.items[idx];
+        // draining/removed are sticky admin decisions — an ordinary probe
+        // success must never flip a decommissioning node back to alive.
+        if (n.state == .draining or n.state == .removed) return;
         n.fail_count = 0;
         if (n.state != .alive) {
             n.state = .alive;
@@ -266,6 +317,7 @@ pub const Membership = struct {
         defer self.mutex.unlock();
         if (idx >= self.nodes.items.len) return;
         const n = &self.nodes.items[idx];
+        if (n.state == .draining or n.state == .removed) return;
         n.fail_count +|= 1;
         const new_state: NodeState = if (n.fail_count >= self.probe_fails_threshold) .down else .suspect;
         if (new_state != n.state) {
@@ -275,6 +327,52 @@ pub const Membership = struct {
             _ = self.generation.fetchAdd(1, .monotonic);
             std.log.warn("membership: node {s} -> {s}", .{ n.id, @tagName(new_state) });
         }
+    }
+
+    /// Mark node `id` `draining`: an admin-initiated decommission. The node
+    /// stays a valid READ source (`placement`/`isUsable`) until the
+    /// rebalance sweep migrates its shards elsewhere, but is immediately
+    /// excluded from `Orchestrator.writePlacement`'s HRW candidate pool, so
+    /// new writes and rebalance targets stop landing on it. Sticky: a
+    /// `removed` node is never downgraded back to `draining`. Idempotent.
+    /// Returns `error.UnknownNode` if `id` isn't a known node.
+    pub fn markDraining(self: *Membership, id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.nodes.items) |*n| {
+            if (!std.mem.eql(u8, n.id, id)) continue;
+            if (n.state == .removed or n.state == .draining) return; // terminal/idempotent
+            n.state = .draining;
+            n.incarnation += 1;
+            n.last_change_ms = std.time.milliTimestamp();
+            _ = self.generation.fetchAdd(1, .monotonic);
+            std.log.info("membership: node {s} -> draining", .{n.id});
+            self.persistOverlayLocked();
+            return;
+        }
+        return error.UnknownNode;
+    }
+
+    /// Mark node `id` `removed`: the terminal state of a decommission.
+    /// Dropped from the persisted peer overlay on the next persist (see
+    /// `persistOverlayLocked`). Called by the rebalance sweep once a
+    /// draining node has migrated away every locally-held shard. Idempotent.
+    /// Returns `error.UnknownNode` if `id` isn't a known node.
+    pub fn markRemoved(self: *Membership, id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.nodes.items) |*n| {
+            if (!std.mem.eql(u8, n.id, id)) continue;
+            if (n.state == .removed) return; // idempotent
+            n.state = .removed;
+            n.incarnation += 1;
+            n.last_change_ms = std.time.milliTimestamp();
+            _ = self.generation.fetchAdd(1, .monotonic);
+            std.log.info("membership: node {s} -> removed", .{n.id});
+            self.persistOverlayLocked();
+            return;
+        }
+        return error.UnknownNode;
     }
 
     /// Add a new node if `id` is unknown. Returns `true` if it was added.
@@ -307,7 +405,11 @@ pub const Membership = struct {
     /// Minimal SWIM-lite gossip merge: adopt any node id present in `json`
     /// (an array of `{"id","host","port",...}` objects, i.e. the shape
     /// produced by `snapshotJson`) that we don't already know about. See
-    /// the module doc comment for why we don't adopt remote state opinions.
+    /// the module doc comment for why we don't adopt remote alive/suspect/
+    /// down opinions — `draining`/`removed` are the one exception: those
+    /// ARE adopted (see `adoptGossipState`) so an admin-initiated
+    /// decommission propagates cluster-wide without every node needing to
+    /// be hit directly.
     pub fn mergeGossip(self: *Membership, json: []const u8) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
         defer parsed.deinit();
@@ -326,6 +428,40 @@ pub const Membership = struct {
             _ = self.addNode(id_v.string, host_v.string, port) catch |e| {
                 std.log.debug("membership: gossip addNode failed: {any}", .{e});
             };
+            if (obj.get("state")) |state_v| {
+                if (state_v == .string) {
+                    if (parseStateStr(state_v.string)) |incoming| {
+                        if (incoming == .draining or incoming == .removed) {
+                            self.adoptGossipState(id_v.string, incoming);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adopt a `draining`/`removed` opinion learned via gossip for a known
+    /// node. `removed` beats `draining` beats anything already set; a
+    /// `removed` node is never un-removed.
+    fn adoptGossipState(self: *Membership, id: []const u8, incoming: NodeState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.nodes.items) |*n| {
+            if (!std.mem.eql(u8, n.id, id)) continue;
+            if (n.state == .removed) return; // terminal
+            if (incoming == .removed) {
+                n.state = .removed;
+            } else if (incoming == .draining and n.state != .draining) {
+                n.state = .draining;
+            } else {
+                return; // no change (already draining)
+            }
+            n.incarnation += 1;
+            n.last_change_ms = std.time.milliTimestamp();
+            _ = self.generation.fetchAdd(1, .monotonic);
+            std.log.info("membership: node {s} -> {s} (via gossip)", .{ n.id, @tagName(n.state) });
+            self.persistOverlayLocked();
+            return;
         }
     }
 
@@ -366,6 +502,14 @@ pub const Membership = struct {
                 }
             }
             if (exists) continue;
+            // `draining` is the only non-default state ever persisted (see
+            // `persistOverlayLocked` — `removed` nodes are dropped from the
+            // file entirely, never written), so that's the only one to
+            // restore here; anything else (or missing) defaults to `alive`.
+            var state: NodeState = .alive;
+            if (obj.get("state")) |sv| {
+                if (sv == .string and std.mem.eql(u8, sv.string, "draining")) state = .draining;
+            }
             const id_owned = try self.allocator.dupe(u8, id_v.string);
             errdefer self.allocator.free(id_owned);
             const host_owned = try self.allocator.dupe(u8, host_v.string);
@@ -374,7 +518,7 @@ pub const Membership = struct {
                 .id = id_owned,
                 .host = host_owned,
                 .port = port,
-                .state = .alive,
+                .state = state,
                 .incarnation = 0,
                 .last_change_ms = std.time.milliTimestamp(),
                 .is_self = false,
@@ -384,20 +528,31 @@ pub const Membership = struct {
 
     /// Must be called with `self.mutex` held. Best-effort: logs and
     /// swallows errors rather than propagating (persistence failing must
-    /// never break the in-memory join).
+    /// never break the in-memory join). `removed` nodes are dropped from
+    /// the file entirely (decommission is meant to forget them); `draining`
+    /// is persisted with an explicit `"state"` field so a restart doesn't
+    /// silently un-drain a node mid-decommission.
     fn persistOverlayLocked(self: *Membership) void {
         var buf: std.ArrayList(u8) = .{};
         defer buf.deinit(self.allocator);
         buf.appendSlice(self.allocator, "[") catch return;
         var first = true;
         for (self.nodes.items[self.initial_count..]) |n| {
+            if (n.state == .removed) continue;
             if (!first) buf.appendSlice(self.allocator, ",") catch return;
             first = false;
-            const entry = std.fmt.allocPrint(
-                self.allocator,
-                "{{\"id\":\"{s}\",\"host\":\"{s}\",\"port\":{d}}}",
-                .{ n.id, n.host, n.port },
-            ) catch return;
+            const entry = if (n.state == .draining)
+                std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"id\":\"{s}\",\"host\":\"{s}\",\"port\":{d},\"state\":\"draining\"}}",
+                    .{ n.id, n.host, n.port },
+                ) catch return
+            else
+                std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"id\":\"{s}\",\"host\":\"{s}\",\"port\":{d}}}",
+                    .{ n.id, n.host, n.port },
+                ) catch return;
             defer self.allocator.free(entry);
             buf.appendSlice(self.allocator, entry) catch return;
         }
@@ -414,6 +569,17 @@ pub const Membership = struct {
         };
     }
 };
+
+/// Parse the `"state"` string field used by `snapshotJson`/the overlay
+/// file/`mergeGossip`'s wire format back into a `NodeState`.
+fn parseStateStr(s: []const u8) ?NodeState {
+    if (std.mem.eql(u8, s, "alive")) return .alive;
+    if (std.mem.eql(u8, s, "suspect")) return .suspect;
+    if (std.mem.eql(u8, s, "down")) return .down;
+    if (std.mem.eql(u8, s, "draining")) return .draining;
+    if (std.mem.eql(u8, s, "removed")) return .removed;
+    return null;
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -556,4 +722,118 @@ test "isUsable reflects down state; hostPortOf resolves joined node" {
     m.recordProbeFailure(1);
     m.recordProbeFailure(1);
     try std.testing.expect(!m.isUsable(1));
+}
+
+test "markDraining: usable for reads, excluded from placementIds, sticky against probe success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const peers = [_]config_mod.Peer{
+        .{ .id = "n0", .host = "h0", .port = 9000 },
+        .{ .id = "n1", .host = "h1", .port = 9001 },
+        .{ .id = "n2", .host = "h2", .port = 9002 },
+    };
+    const cfg = testConfig(&peers, 0);
+    const m = try Membership.init(std.testing.allocator, &cfg, tmp.dir);
+    defer m.deinit();
+
+    try std.testing.expectError(error.UnknownNode, m.markDraining("nope"));
+
+    try m.markDraining("n1");
+    try std.testing.expectEqual(NodeState.draining, m.stateOf(1));
+    try std.testing.expect(m.isUsable(1)); // still a read source
+
+    var id_buf: [8][]const u8 = undefined;
+    var idx_buf: [8]usize = undefined;
+    const ids = m.placementIds(&id_buf, &idx_buf);
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    for (ids) |id| try std.testing.expect(!std.mem.eql(u8, id, "n1"));
+
+    // An ordinary probe success must not flip draining back to alive.
+    m.recordProbeSuccess(1);
+    try std.testing.expectEqual(NodeState.draining, m.stateOf(1));
+
+    // Nor does a probe failure escalate it to down.
+    m.recordProbeFailure(1);
+    m.recordProbeFailure(1);
+    m.recordProbeFailure(1);
+    try std.testing.expectEqual(NodeState.draining, m.stateOf(1));
+
+    // Idempotent re-mark.
+    try m.markDraining("n1");
+    try std.testing.expectEqual(NodeState.draining, m.stateOf(1));
+}
+
+test "mergeGossip adopts draining/removed opinions but never alive/suspect/down" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const peers = [_]config_mod.Peer{
+        .{ .id = "n0", .host = "h0", .port = 9000 },
+        .{ .id = "n1", .host = "h1", .port = 9001 },
+    };
+    const cfg = testConfig(&peers, 0);
+    const m = try Membership.init(std.testing.allocator, &cfg, tmp.dir);
+    defer m.deinit();
+
+    // A peer reporting n1 as suspect must NOT change our local view.
+    try m.mergeGossip(
+        \\[{"id":"n1","host":"h1","port":9001,"state":"suspect"}]
+    );
+    try std.testing.expectEqual(NodeState.alive, m.stateOf(1));
+
+    // A peer reporting n1 as draining IS adopted.
+    try m.mergeGossip(
+        \\[{"id":"n1","host":"h1","port":9001,"state":"draining"}]
+    );
+    try std.testing.expectEqual(NodeState.draining, m.stateOf(1));
+
+    // A later "alive" opinion must not undo the draining state.
+    try m.mergeGossip(
+        \\[{"id":"n1","host":"h1","port":9001,"state":"alive"}]
+    );
+    try std.testing.expectEqual(NodeState.draining, m.stateOf(1));
+
+    // removed beats draining and is terminal.
+    try m.mergeGossip(
+        \\[{"id":"n1","host":"h1","port":9001,"state":"removed"}]
+    );
+    try std.testing.expectEqual(NodeState.removed, m.stateOf(1));
+    try m.mergeGossip(
+        \\[{"id":"n1","host":"h1","port":9001,"state":"draining"}]
+    );
+    try std.testing.expectEqual(NodeState.removed, m.stateOf(1));
+}
+
+test "markRemoved drops the node from the persisted overlay" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const peers = [_]config_mod.Peer{
+        .{ .id = "n0", .host = "h0", .port = 9000 },
+    };
+    const cfg = testConfig(&peers, 0);
+    const m = try Membership.init(std.testing.allocator, &cfg, tmp.dir);
+    defer m.deinit();
+
+    _ = try m.addNode("n1", "h1", 9001);
+    _ = try m.addNode("n2", "h2", 9002);
+    try m.markDraining("n1");
+
+    try std.testing.expectError(error.UnknownNode, m.markRemoved("nope"));
+    try m.markRemoved("n1");
+    try std.testing.expectEqual(NodeState.removed, m.stateOf(1));
+    try std.testing.expect(!m.isUsable(1));
+
+    // Idempotent.
+    try m.markRemoved("n1");
+    try std.testing.expectEqual(NodeState.removed, m.stateOf(1));
+
+    // Re-loading from the persisted overlay must NOT resurrect n1 (dropped
+    // entirely) — a fresh Membership over the same data_dir only re-learns
+    // n2 (never removed).
+    const m2 = try Membership.init(std.testing.allocator, &cfg, tmp.dir);
+    defer m2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), m2.count()); // n0 (config) + n2 (overlay)
+    try std.testing.expectEqualStrings("n2", m2.nodes.items[1].id);
 }

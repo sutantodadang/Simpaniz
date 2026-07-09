@@ -60,7 +60,9 @@ src/
                     with sparse footer) under `<bucket>/.simpaniz-index/`.
                     Serves `ListObjectsV2` with flat memory on huge buckets;
                     falls back to FS-walk-and-sort with lazy bootstrap.
-                    Single-node only — cluster listing still FS-walk.
+                    Bootstrap source is pluggable (`BootstrapSource`) so
+                    cluster mode can reuse the same LSM-lite machinery over
+                    a different on-disk layout — see `cluster/list_index.zig`.
   tiering.zig       Lifecycle `<Transition>` cold-storage tiering. Moves
                     on-disk bytes to `SIMPANIZ_TIER_DIR` (local) or a
                     SigV4-signed remote S3-compatible target
@@ -176,7 +178,10 @@ checks.
   (no more full-object EC buffers). Still no Raft, no decommission.
 - Event notifications support webhook only (no Kafka/NATS/AMQP/MQTT).
 - Single-node listings are served from a per-bucket LSM-lite index
-  (`index.zig`); cluster-mode listings are still walked in memory.
+  (`index.zig`); cluster-mode listings are now index-backed too — each node
+  indexes the cluster meta it stores locally, and the listing node merges
+  sorted pages from every usable node (`cluster/list_index.zig`,
+  `cluster/list_merge.zig`).
 - Connection model is thread-per-conn, not evented.
 
 These are the items that turn an "S3-compatible server" into a
@@ -229,14 +234,26 @@ multi-node erasure-coded storage:
   stored keys, recomputes HRW placement under the current node list, and
   migrates any shard no longer owned locally to its new owner
   (copy+verify+delete). May leave orphaned local meta after a migration.
+- `list_index.zig` / `list_merge.zig` — Index-backed, cluster-wide
+  `ListObjectsV2`. Every node maintains an `index.zig` LSM-lite index over
+  its own `.simpaniz-meta/<bucket>/<key>.meta` (bootstrap adapted via
+  `index.zig`'s pluggable `BootstrapSource` to parse cluster meta JSON
+  instead of walking real object files). The listing node queries every
+  usable node's local index page (`Transport.listMeta` — self short-
+  circuits, peers go over `/_simpaniz/list`) and k-way merges the sorted
+  streams, deduping same-key entries (meta is replicated to every
+  placement node) by newest `last_modified`, then feeds the merged stream
+  through the same pagination/delimiter/CommonPrefixes bookkeeping as
+  single-node so `max-keys`/`continuation-token`/`start-after` semantics
+  stay identical. A peer fetch failing twice fails the whole request
+  (500) rather than returning a partial listing.
 
 Remaining distributed-mode gaps:
 
 - No Raft; membership state (alive/suspect/down) is locally observed per
   node, not distributed-consensus voted. No node decommission.
-- Advanced feature parity in cluster mode, including version listings, the
-  full SSE/versioning/lifecycle/object-lock matrix, and the metadata index
-  layer (cluster listing still FS-walk).
+- Advanced feature parity in cluster mode, including version listings and
+  the full SSE/versioning/lifecycle/object-lock matrix.
 - Stronger replication conflict/ordering semantics. (Event notifications now
   exist standalone via `events.zig`, not yet cluster-aware.)
 - Migrated shards from a rebalance sweep may leave orphaned local meta.

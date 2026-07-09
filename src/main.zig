@@ -7,6 +7,7 @@ const bootstrap = @import("bootstrap.zig");
 const iam = @import("iam.zig");
 const events = @import("events.zig");
 const tls_server = @import("tls_server.zig");
+const acme = @import("acme.zig");
 const index_mod = @import("index.zig");
 const tiering_mod = @import("tiering.zig");
 const sts = @import("sts.zig");
@@ -35,16 +36,19 @@ pub fn main() !void {
 
     std.log.info("Simpaniz v0.1.1 starting (data={s}, region={s})", .{ config.data_dir, config.region });
 
-    var tls_ctx: ?*tls_server.ServerContext = null;
+    // Manual TLS (SIMPANIZ_TLS_CERT/_KEY) and zero-config ACME
+    // (SIMPANIZ_TLS_ACME) are mutually exclusive — same "refuse startup"
+    // style as the existing cert/key pairing check below.
+    if (config.tls_acme_domain.len > 0 and (config.tls_cert_path.len > 0 or config.tls_key_path.len > 0)) {
+        std.log.err("SIMPANIZ_TLS_ACME is mutually exclusive with SIMPANIZ_TLS_CERT/SIMPANIZ_TLS_KEY.", .{});
+        return error.TlsConfigIncomplete;
+    }
     if (config.tls_cert_path.len > 0 or config.tls_key_path.len > 0) {
         if (config.tls_cert_path.len == 0 or config.tls_key_path.len == 0) {
             std.log.err("Set BOTH SIMPANIZ_TLS_CERT and SIMPANIZ_TLS_KEY (or neither).", .{});
             return error.TlsConfigIncomplete;
         }
-        tls_ctx = try tls_server.ServerContext.load(gpa, config.tls_cert_path, config.tls_key_path);
-        std.log.info("TLS enabled (in-process TLS 1.3): cert={s}", .{config.tls_cert_path});
     }
-    defer if (tls_ctx) |t| t.deinit();
 
     var data_dir = blk: {
         if (std.fs.path.isAbsolute(config.data_dir)) {
@@ -64,6 +68,46 @@ pub fn main() !void {
     // env vars, mirroring the MinIO root-user UX so the web console works
     // out of the box.
     try bootstrap.ensureCredentials(&config, data_dir);
+
+    // TLS: manual cert/key, ACME auto-cert, or plaintext (neither set).
+    // `tls_holder_storage` is addressed into by `tls_holder` below and must
+    // outlive `server.start`, so it lives in this function's own frame
+    // rather than being heap-allocated (mirrors `registry`/`cluster_cfg`
+    // elsewhere in this function).
+    var tls_holder_storage: acme.TlsHolder = undefined;
+    var tls_holder: ?*acme.TlsHolder = null;
+    if (config.tls_acme_domain.len > 0) {
+        const contact: ?[]const u8 = if (config.acme_contact.len > 0) config.acme_contact else null;
+        try acme.ensureCertificate(gpa, data_dir, config.tls_acme_domain, config.acme_directory_url, contact, config.acme_http_port);
+
+        const paths = try acme.statePaths(gpa, config.data_dir);
+        const ctx0 = try tls_server.ServerContext.load(gpa, paths.cert_path, paths.key_path);
+        tls_holder_storage = .{ .ctx = ctx0 };
+        tls_holder = &tls_holder_storage;
+
+        // Kept for the dashboard's `tls_cert_path.len > 0` status check.
+        config.tls_cert_path = try config.arena.allocator().dupe(u8, paths.cert_path);
+        std.log.info("TLS enabled (ACME): domain={s} directory={s}", .{ config.tls_acme_domain, config.acme_directory_url });
+
+        const renewal_ctx = try gpa.create(acme.RenewalCtx);
+        renewal_ctx.* = .{
+            .gpa = gpa,
+            .state_dir = try data_dir.openDir(".simpaniz-acme", .{}),
+            .cert_path = paths.cert_path,
+            .key_path = paths.key_path,
+            .domain = config.tls_acme_domain,
+            .directory_url = config.acme_directory_url,
+            .contact = contact,
+            .http_port = config.acme_http_port,
+            .holder = tls_holder.?,
+        };
+        try acme.startRenewalDaemon(renewal_ctx);
+    } else if (config.tls_cert_path.len > 0) {
+        const ctx0 = try tls_server.ServerContext.load(gpa, config.tls_cert_path, config.tls_key_path);
+        tls_holder_storage = .{ .ctx = ctx0 };
+        tls_holder = &tls_holder_storage;
+        std.log.info("TLS enabled (in-process TLS 1.3): cert={s}", .{config.tls_cert_path});
+    }
 
     var iam_store = iam.load(gpa, data_dir);
     defer iam_store.deinit();
@@ -147,7 +191,7 @@ pub fn main() !void {
         .cluster = cluster_rt,
         .iam = &iam_store,
         .notifier = notifier,
-        .tls = tls_ctx,
+        .tls = tls_holder,
         .index = if (cluster_rt == null) &index_mgr else null,
         .tiering = &tiering_ctx,
         .sts = &sts_store,
@@ -170,6 +214,7 @@ test {
     _ = @import("iam.zig");
     _ = @import("events.zig");
     _ = @import("tls_server.zig");
+    _ = @import("acme.zig");
     _ = @import("index.zig");
     _ = @import("tiering.zig");
     _ = @import("sts.zig");

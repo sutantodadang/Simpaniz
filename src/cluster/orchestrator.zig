@@ -33,6 +33,7 @@ const rendezvous = @import("rendezvous.zig");
 const transport_mod = @import("transport.zig");
 const membership_mod = @import("membership.zig");
 const config_mod = @import("config.zig");
+const types_mod = @import("../storage/types.zig");
 
 pub const ShardId = transport_mod.ShardId;
 pub const Transport = transport_mod.Transport;
@@ -102,7 +103,12 @@ pub const Orchestrator = struct {
         return self.nodes;
     }
 
-    /// Compute placement: `out[i]` = node index that owns shard `i`.
+    /// Compute placement: `out[i]` = node index that owns shard `i`. This is
+    /// the READ path (`get`/`heal`/`getRangeStreaming`/`delete`): a
+    /// `draining` node is deliberately still part of the candidate pool
+    /// here, since it still physically holds its shards until the
+    /// rebalance sweep migrates them off. See `writePlacement` for the
+    /// write-side variant that excludes `draining`/`removed` nodes.
     pub fn placement(self: *const Orchestrator, bucket: []const u8, key: []const u8, out: []usize) !void {
         const total = self.codec.shardCount();
         if (out.len != total) return error.InvalidArgument;
@@ -112,6 +118,38 @@ pub const Orchestrator = struct {
         const nodes = self.currentNodes(&node_buf);
         const p = try rendezvous.pick(nodes, pkey, total);
         for (0..total) |i| out[i] = p.indices[i];
+    }
+
+    /// Node ids eligible for WRITE placement (membership snapshot minus
+    /// `draining`/`removed`, or the fixed `nodes` fallback when no
+    /// membership is attached — nothing to exclude there). `idx_buf[j]` is
+    /// the TRUE node index of `id_buf[j]`, needed because rendezvous.pick's
+    /// result indices are only local to whatever slice it was given.
+    fn currentNodesForWrite(self: *const Orchestrator, id_buf: [][]const u8, idx_buf: []usize) []const []const u8 {
+        if (self.membership) |mem| return mem.placementIds(id_buf, idx_buf);
+        const n = @min(id_buf.len, self.nodes.len);
+        for (0..n) |i| {
+            id_buf[i] = self.nodes[i];
+            idx_buf[i] = i;
+        }
+        return id_buf[0..n];
+    }
+
+    /// Compute placement for NEW writes and rebalance targets: like
+    /// `placement`, but nodes marked `draining`/`removed` are excluded from
+    /// the HRW candidate pool, so a decommissioning node is never (re-)
+    /// chosen as an owner. Used by `put`/`putStreaming` and by
+    /// `rebalance.migrateKeyCore`.
+    pub fn writePlacement(self: *const Orchestrator, bucket: []const u8, key: []const u8, out: []usize) !void {
+        const total = self.codec.shardCount();
+        if (out.len != total) return error.InvalidArgument;
+        var kb: [1024]u8 = undefined;
+        const pkey = try placementKey(&kb, bucket, key);
+        var id_buf: [max_live_nodes][]const u8 = undefined;
+        var idx_buf: [max_live_nodes]usize = undefined;
+        const nodes = self.currentNodesForWrite(&id_buf, &idx_buf);
+        const p = try rendezvous.pick(nodes, pkey, total);
+        for (0..total) |i| out[i] = idx_buf[p.indices[i]];
     }
 
     /// EC-encode `data` into k data + m parity shards and scatter them
@@ -172,7 +210,7 @@ pub const Orchestrator = struct {
             base_chunk;
 
         var place: [reed_solomon.max_shards]usize = undefined;
-        try self.placement(bucket, key, place[0..total]);
+        try self.writePlacement(bucket, key, place[0..total]);
 
         const stripe_data_cap = k * chunk;
         const n_stripes: usize = if (total_size == 0) 1 else (total_size + stripe_data_cap - 1) / stripe_data_cap;
@@ -870,6 +908,7 @@ const CountingTransport = struct {
             .appendShardChunk = appendChunk,
             .getShardRange = getRange,
             .statShard = statShardFn,
+            .listMeta = listMeta,
         } };
     }
     fn put(ctx: *anyopaque, node: usize, sid: ShardId, data: []const u8) anyerror!void {
@@ -908,6 +947,10 @@ const CountingTransport = struct {
         const self: *CountingTransport = @ptrCast(@alignCast(ctx));
         self.stat_counts[node] += 1;
         return self.inner.statShard(node, sid);
+    }
+    fn listMeta(ctx: *anyopaque, node: usize, bucket: []const u8, opts: types_mod.ListOpts, allocator: Allocator) anyerror!types_mod.ListPage {
+        const self: *CountingTransport = @ptrCast(@alignCast(ctx));
+        return self.inner.listMeta(node, bucket, opts, allocator);
     }
 };
 

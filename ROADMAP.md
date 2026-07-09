@@ -18,9 +18,9 @@ Status legend: ✅ done · ⚠️ partial · ❌ missing
 | IAM / policy | Multi-user, PBAC enforced, STS, groups | multi-user store + policy **enforced** (`iam.zig`) + STS (`sts.zig`) | groups |
 | Identity | OIDC, LDAP, AssumeRole | AssumeRole + AssumeRoleWithWebIdentity (OIDC, ES256+RS256) (`sts.zig`) | LDAP |
 | Encryption | SSE-S3/KMS/C complete, KES | SSE-S3/C/KMS(local keyring) complete: multipart, copy, range, default-bucket (`sse.zig`) | external KMS/KES |
-| TLS | in-process | in-process TLS 1.3 (`tls_server.zig`) | ACME auto-cert (stretch) |
-| Cluster | erasure sets, rebalance, dist. locks | SWIM-lite membership (probe/gossip/join) + HRW rebalance daemon (`membership.zig`, `rebalance.zig`) | dist. locks, decommission |
-| Listing | metadata layer | per-bucket LSM-lite index (`index.zig`), FS-walk fallback | none (single-node only; cluster still FS-walk) |
+| TLS | in-process | in-process TLS 1.3 (`tls_server.zig`) + ACME auto-cert (`acme.zig`, `SIMPANIZ_TLS_ACME`) | none — parity + differentiator |
+| Cluster | erasure sets, rebalance, dist. locks | SWIM-lite membership (probe/gossip/join) + HRW rebalance daemon (`membership.zig`, `rebalance.zig`) + drain/auto-remove decommission | dist. locks |
+| Listing | metadata layer | per-bucket LSM-lite index (`index.zig`); cluster-mode listing merges each node's index over an internal route (`cluster/list_index.zig`, `cluster/list_merge.zig`) | none — parity |
 | Events | webhook/Kafka/NATS/AMQP/MQTT | webhook (`events.zig`) | Kafka/NATS/AMQP/MQTT targets |
 | Replication | active-active, sync | async best-effort (`replication.zig`) | sync + bidirectional |
 | Tiering | hot→cold (S3/GCS/Azure) | lifecycle `<Transition>` → local cold dir or remote S3-compatible target, transparent GET (`tiering.zig`) | native GCS/Azure backends |
@@ -48,17 +48,29 @@ These four block real multi-tenant use. Highest priority. **All four DONE**
   second user with read-only policy gets `403` on PUT. Verified live: bucket
   policy Deny s3:PutObject → 403, GET still 200.
 
-### 1.2 In-process TLS ❌→✅ DONE (ACME stretch still open)
+### 1.2 In-process TLS ❌→✅ DONE (ACME stretch ❌→✅ DONE)
 - **New file:** `src/tls_server.zig`. Touch: `main.zig`, `server.zig`.
 - Hand-rolled TLS 1.3 server (Zig std has client only), reusing
   `std.crypto.tls` wire types. TLS 1.3 only; AES-128/256-GCM +
   ChaCha20-Poly1305; x25519 key exchange only; ECDSA P-256 server certs
   (PKCS#8/SEC1); ALPN `http/1.1`. No client certs, resumption, or 0-RTT.
 - Load `SIMPANIZ_TLS_CERT`/`SIMPANIZ_TLS_KEY` PEM (both required together).
-- **Stretch (differentiator, still open):** ACME/Let's-Encrypt auto-cert
-  (`SIMPANIZ_TLS_ACME=domain`).
+- **Stretch (differentiator) shipped:** ACME/Let's-Encrypt auto-cert
+  (`SIMPANIZ_TLS_ACME=domain`) — **new:** `src/acme.zig`. Hand-rolled ACME v2
+  (RFC 8555) client: JWS (ES256), RFC 7638 JWK thumbprint, a minimal PKCS#10
+  CSR DER writer, and an HTTP-01 challenge listener, all on top of
+  `std.crypto`/`std.http.Client`/`std.json` (zero new deps). Account/domain
+  keys and the issued cert persist under `<DATA_DIR>/.simpaniz-acme/`; issued
+  synchronously on boot if missing or near-expiry, then a daily background
+  daemon re-issues within 30 days of expiry and hot-swaps the new cert/key
+  pair into the running TLS listener (mutex-guarded pointer swap in
+  `acme.TlsHolder`, read once per accepted connection) with no restart and no
+  dropped connections. Mutually exclusive with `SIMPANIZ_TLS_CERT`/`_KEY`.
 - **Accept:** `curl https://localhost:9000/` works with no reverse proxy.
-  Verified live over HTTPS with curl.
+  Verified live over HTTPS with curl. ACME building blocks (base64url, JWS
+  sign+verify, JWK thumbprint, CSR build+parse+signature-verify, X.509
+  notAfter parsing, HTTP-01 responder) covered by an offline test suite (no
+  live ACME network calls in tests).
 
 ### 1.3 SSE completeness ⚠️→✅ DONE
 - **Files:** `storage/sse.zig`, `storage/multipart.zig`, `storage/objects.zig`,
@@ -91,7 +103,16 @@ These four block real multi-tenant use. Highest priority. **All four DONE**
 - Replaced in-mem FS walk+sort with per-bucket LSM-lite under
   `<bucket>/.simpaniz-index/` (WAL + sorted segment with sparse footer);
   listing served from index with FS-walk fallback + lazy bootstrap.
-  Single-node only — cluster listing still FS-walk.
+- **Cluster-mode listing ⚠️→✅ DONE:** `ListObjectsV2` in cluster mode
+  previously walked only the local node's FS and never saw remote nodes'
+  keys. Each node now maintains its own LSM-lite index over the cluster meta
+  it stores locally; the listing node fetches every usable peer's index page
+  over a new internal route (`GET /_simpaniz/list`, routed through the
+  existing `Transport` vtable) and k-way merges the sorted streams, deduping
+  replicated entries by newest mtime, through the same pagination/delimiter
+  bookkeeping as single-node (`cluster/list_index.zig`, `cluster/list_merge.zig`).
+  A peer fetch failing twice fails the whole request rather than returning a
+  partial listing.
 - Also fixed a pre-existing pagination data-loss bug: the continuation-token
   boundary key was silently dropped on every truncated page (both listers now
   zero-loss; token is inclusive, `start-after` exclusive).
@@ -120,10 +141,22 @@ These four block real multi-tenant use. Highest priority. **All four DONE**
   membership-change-triggered sweeps) migrates shards to new HRW owners
   (copy+verify+delete). `/cluster/health` now includes per-node membership
   states.
-- Limitations: joiner needs full peer list in its own env; no decommission;
-  migrated shards may leave orphaned local meta.
+- **Node decommission ❌→✅ DONE:** admin-driven drain + auto-remove flow. A
+  node marked `draining` (`POST /_admin/cluster/decommission?node=<id>`,
+  root-only, or `simpaniz admin cluster decommission <node-id>`) stays a read
+  source while the rebalance daemon migrates its shards off to the remaining
+  nodes (write placement excludes draining/removed nodes; reads are
+  unaffected so in-flight reads still find not-yet-migrated shards). Once a
+  draining node's own sweep reaches zero local shards and zero errors, it
+  auto-promotes to `removed` and drops out of the persisted peer overlay;
+  `draining`/`removed` are sticky and gossip-propagate with
+  `removed > draining` precedence, so decommissioning can be issued against
+  any node in the cluster.
+- Limitations: joiner needs full peer list in its own env; migrated shards may
+  leave orphaned local meta.
 - **Accept:** add a 4th node to a 3-node cluster → shards redistribute without
-  client errors; killing a node marks it down within probe interval.
+  client errors; killing a node marks it down within probe interval;
+  decommissioning a node drains its shards and it drops out of membership.
 
 ---
 
@@ -157,8 +190,16 @@ All six DONE (~175 tests green, live smoke-tested).
   local file becomes a stub. GET transparently fetches from cold (spooled to
   a temp file). `x-amz-storage-class` header echoed. SSE composes — cold
   storage holds the same on-disk (encrypted) bytes.
+- **Cold-GET rehydration ❌→✅ DONE:** `SIMPANIZ_TIER_REHYDRATE=1` writes a
+  fetched cold object back to hot local storage (tmp + fsync + rename,
+  mirroring the PUT path) and clears the metadata sidecar's tiered marker,
+  then deletes the cold copy (local file, or a new SigV4-signed DELETE for a
+  remote tier). Best-effort — any failure is logged and the GET still serves
+  the already-fetched bytes; default off (preserves always-re-fetch
+  behavior).
 - **Accept:** object older than N days transitions; GET still returns it
-  (pulled from cold).
+  (pulled from cold); with rehydration on, a second GET is served hot without
+  re-fetching from the tier.
 
 ### 3.5 STS / external identity ❌→✅ DONE
 - **New:** `src/sts.zig`.
@@ -195,7 +236,10 @@ Don't out-feature MinIO on its turf — win where it's heavy or weak.
    Guard rule: every new feature must justify any new dependency or stay stdlib.
    Still holding after the P4 dashboard bet — no new deps added (dashboard.js
    is vanilla canvas/JS, embedded like the rest of the console).
-2. **Zero-config TLS** — ACME auto-cert (1.2 stretch). MinIO needs manual setup.
+2. **Zero-config TLS ❌→✅ DONE** — ACME auto-cert (1.2 stretch, `src/acme.zig`,
+   `SIMPANIZ_TLS_ACME`). MinIO needs manual cert setup or a reverse proxy;
+   Simpaniz obtains and auto-renews a Let's Encrypt certificate with zero
+   manual steps.
 3. **One binary = server + client + admin** — no separate `mc`.
 4. **Deep bet — CHOSEN: built-in single-binary metrics+UI dashboard ❌→✅ DONE.**
    Per the "pick ONE" rule, the other two candidates were **not built**:
@@ -238,7 +282,8 @@ P1.4 Evt ─┘
 
 - **P1 is done** — IAM enforcement, in-process TLS, SSE completeness, and event
   notifications all shipped (121 tests green, live smoke-tested). "Production
-  multi-tenant" claim now holds; ACME auto-cert remains a P4 stretch item.
+  multi-tenant" claim now holds; ACME auto-cert (P4 stretch item) has since
+  shipped too — see P4 below.
 - **P2 is done** — metadata index layer, streaming EC, and cluster
   membership + rebalance all shipped (141 tests green, benchmarked).
 - **P3 is done** — versioning suspended-null semantics, lifecycle
@@ -249,7 +294,8 @@ P1.4 Evt ─┘
   metrics+UI dashboard (`timeseries.zig`, `dashboard.zig`, console Metrics
   tab). The other two candidate bets (WASM/Lua transform filters, sync
   active-active replication) were intentionally not built, per "pick ONE."
-  Footprint/one-binary properties still hold.
+  Footprint/one-binary properties still hold. The ACME auto-cert stretch item
+  (`src/acme.zig`) also shipped, closing out the last open item from 1.2.
 
 ## Anti-goals
 

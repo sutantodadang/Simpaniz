@@ -34,6 +34,10 @@ const ShardId = transport_mod.ShardId;
 const orchestrator_mod = @import("orchestrator.zig");
 const Orchestrator = orchestrator_mod.Orchestrator;
 const runtime_mod = @import("runtime.zig");
+const membership_mod = @import("membership.zig");
+const config_mod = @import("config.zig");
+const list_index_mod = @import("list_index.zig");
+const types_mod = @import("../storage/types.zig");
 
 pub const Stats = struct {
     scanned: u64 = 0,
@@ -42,15 +46,47 @@ pub const Stats = struct {
     errors: u64 = 0,
 };
 
-/// Production entry point — sweeps `rt`'s locally stored keys.
+/// Production entry point — sweeps `rt`'s locally stored keys, then lets the
+/// node auto-complete its own drain (see `runOnceDraining`).
 pub fn runOnce(rt: *runtime_mod.ClusterRuntime, allocator: Allocator) !Stats {
-    return runOnceCore(
+    return runOnceDraining(
         allocator,
         &rt.orchestrator,
         rt.http_transport.transport(),
         rt.data_dir,
         rt.config.self_index,
+        rt.membership,
     );
+}
+
+/// Sweep once via `runOnceCore`, then — if the local node is currently
+/// `draining` — auto-promote it to `removed` once the sweep leaves zero
+/// local shards behind with zero errors. This is what lets a decommission
+/// complete on its own without an external "is it done yet?" poll: since
+/// `markDraining`/`mergeGossip` bump `Membership.generation`, the existing
+/// interval-independent rebalance daemon (`server.zig`'s `rebalanceLoop`,
+/// which wakes on either the configured interval OR a generation bump)
+/// already reruns this promptly after a node is marked draining.
+pub fn runOnceDraining(
+    allocator: Allocator,
+    orch: *Orchestrator,
+    transport: Transport,
+    data_dir: std.fs.Dir,
+    self_index: usize,
+    membership: *membership_mod.Membership,
+) !Stats {
+    const stats = try runOnceCore(allocator, orch, transport, data_dir, self_index);
+    if (stats.errors == 0 and membership.stateOf(self_index) == .draining) {
+        const has_shards = disk.hasAnyLocalShard(data_dir, allocator) catch true;
+        if (!has_shards) {
+            if (membership.idAt(self_index)) |id| {
+                membership.markRemoved(id) catch |e| {
+                    std.log.warn("rebalance: auto markRemoved failed: {any}", .{e});
+                };
+            }
+        }
+    }
+    return stats;
 }
 
 /// Transport/orchestrator-generic core, reusable in tests against any
@@ -124,7 +160,7 @@ fn migrateKeyCore(
     var place_buf: [32]usize = undefined;
     if (total > place_buf.len) return error.TooManyShards;
     const place = place_buf[0..total];
-    try orch.placement(bucket, key, place);
+    try orch.writePlacement(bucket, key, place);
 
     var moved: u64 = 0;
     for (0..total) |idx| {
@@ -214,6 +250,7 @@ const DiskMultiTransport = struct {
             .appendShardChunk = appendChunk,
             .getShardRange = getRange,
             .statShard = statShardFn,
+            .listMeta = listMetaFn,
         } };
     }
 
@@ -249,6 +286,16 @@ const DiskMultiTransport = struct {
     }
     fn statShardFn(ctx: *anyopaque, node: usize, sid: ShardId) anyerror!u64 {
         return disk.statShard(try dirOf(ctx, node), sid.bucket, sid.key, sid.index);
+    }
+    /// Builds a fresh `list_index.Index` over the node's dir on every call
+    /// (bootstrap is idempotent/incremental — see `index.zig`'s
+    /// `tryOpenExisting`) — fine for tests, keeps `DiskMultiTransport`
+    /// stateless like its other methods.
+    fn listMetaFn(ctx: *anyopaque, node: usize, bucket: []const u8, opts: types_mod.ListOpts, allocator: Allocator) anyerror!types_mod.ListPage {
+        const dir = try dirOf(ctx, node);
+        var idx = try list_index_mod.Index.init(allocator, dir);
+        defer idx.deinit();
+        return idx.list(allocator, bucket, opts);
     }
 };
 
@@ -471,5 +518,109 @@ test "rebalance is a no-op when placement is unchanged" {
         const stats = try runOnceCore(std.testing.allocator, &orch, t, dirs[self_index], self_index);
         try std.testing.expectEqual(@as(u64, 0), stats.moved);
         try std.testing.expectEqual(@as(u64, 0), stats.errors);
+    }
+}
+
+fn testMembershipConfig(peers: []const config_mod.Peer, self_idx: usize) config_mod.ClusterConfig {
+    return .{
+        .arena = undefined,
+        .enabled = true,
+        .node_id = peers[self_idx].id,
+        .peers = peers,
+        .self_index = self_idx,
+        .ec_k = 1,
+        .ec_m = 1,
+        .cluster_secret = "0123456789abcdef",
+        .connect_timeout_ms = 1000,
+        .repl_targets_raw = "",
+        .probe_interval_ms = 2000,
+        .probe_fails_threshold = 3,
+        .rebalance_interval_s = 300,
+        .join = false,
+    };
+}
+
+test "decommission: draining node's shards migrate off, node auto-removes, objects stay readable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dirs: [3]std.fs.Dir = undefined;
+    for (0..3) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "node{d}", .{i});
+        try tmp.dir.makePath(name);
+        dirs[i] = try tmp.dir.openDir(name, .{ .iterate = true });
+    }
+    defer for (&dirs) |*d| d.close();
+
+    var mt: DiskMultiTransport = .{ .dirs = &dirs };
+    const t = mt.transport();
+
+    // k=1, m=1: excluding one of the three nodes from write placement still
+    // leaves enough (2) candidates, and a single surviving shard is enough
+    // to reconstruct an object (full redundancy at k=1) — so reads must
+    // keep working purely off the untouched shard even before/without the
+    // read path ever consulting the migrated-to node.
+    const nodes = [_][]const u8{ "n0", "n1", "n2" };
+    var orch = try Orchestrator.init(std.testing.allocator, &nodes, 1, 1, t);
+    defer orch.deinit();
+
+    const peers = [_]config_mod.Peer{
+        .{ .id = "n0", .host = "h0", .port = 9000 },
+        .{ .id = "n1", .host = "h1", .port = 9001 },
+        .{ .id = "n2", .host = "h2", .port = 9002 },
+    };
+    const cfg = testMembershipConfig(&peers, 0);
+    const mem = try membership_mod.Membership.init(std.testing.allocator, &cfg, tmp.dir);
+    defer mem.deinit();
+    orch.membership = mem;
+
+    const bucket = "buk";
+    const n_keys: usize = 30;
+    var key_buf: [32]u8 = undefined;
+    var results: [n_keys]orchestrator_mod.PutResult = undefined;
+    for (0..n_keys) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "key-{d}", .{i});
+        var data_buf: [64]u8 = undefined;
+        const data = try std.fmt.bufPrint(&data_buf, "decommission payload number {d}!!", .{i});
+        results[i] = try orch.put(bucket, key, data);
+        try writeMetaToPlacement(&dirs, &orch, bucket, key, results[i]);
+    }
+
+    // Sanity: n1 must actually hold shards before draining, else this test
+    // would trivially pass without exercising the migration at all.
+    var held_before: usize = 0;
+    for (0..n_keys) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "key-{d}", .{i});
+        if (try disk.localShardIndex(dirs[1], bucket, key)) |_| held_before += 1;
+    }
+    try std.testing.expect(held_before > 0);
+
+    try mem.markDraining("n1");
+    try std.testing.expectEqual(membership_mod.NodeState.draining, mem.stateOf(1));
+
+    const stats = try runOnceDraining(std.testing.allocator, &orch, t, dirs[1], 1, mem);
+    try std.testing.expectEqual(@as(u64, 0), stats.errors);
+    try std.testing.expect(stats.moved > 0);
+
+    // The draining node auto-promotes to removed once its own sweep leaves
+    // it with zero local shards.
+    try std.testing.expectEqual(membership_mod.NodeState.removed, mem.stateOf(1));
+    try std.testing.expect(!(try disk.hasAnyLocalShard(dirs[1], std.testing.allocator)));
+
+    // n1 is no longer a write-placement candidate.
+    var id_buf: [8][]const u8 = undefined;
+    var idx_buf: [8]usize = undefined;
+    const ids = mem.placementIds(&id_buf, &idx_buf);
+    for (ids) |id| try std.testing.expect(!std.mem.eql(u8, id, "n1"));
+
+    // Every object put before the decommission is still readable.
+    for (0..n_keys) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "key-{d}", .{i});
+        var expect_buf: [64]u8 = undefined;
+        const expect = try std.fmt.bufPrint(&expect_buf, "decommission payload number {d}!!", .{i});
+        const out = try orch.get(bucket, key, results[i].shard_size, results[i].original_size, std.testing.allocator);
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualSlices(u8, expect, out);
     }
 }

@@ -22,6 +22,48 @@ const Allocator = std.mem.Allocator;
 pub const shards_root = ".simpaniz-shards";
 pub const meta_root = ".simpaniz-meta";
 
+/// Per-object cluster metadata (JSON-encoded on disk under `.meta` files).
+/// Lives here (rather than `runtime.zig`) so both `runtime.zig` and
+/// `list_index.zig` (the index-backed cluster-listing bootstrap adapter,
+/// which needs to parse `.meta` files during its FS-walk bootstrap) can
+/// depend on it without an import cycle between the two.
+pub const ObjectMeta = struct {
+    shard_size: usize,
+    original_size: usize,
+    etag: [32]u8, // md5 hex (32 chars)
+    content_type: []const u8,
+    last_modified: i64, // unix seconds
+    encrypted: bool = false,
+
+    pub fn toJson(self: ObjectMeta, allocator: Allocator) ![]u8 {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"v\":1,\"shard_size\":{d},\"original_size\":{d},\"etag\":\"{s}\",\"content_type\":\"{s}\",\"last_modified\":{d},\"encrypted\":{}}}",
+            .{ self.shard_size, self.original_size, self.etag, self.content_type, self.last_modified, self.encrypted },
+        );
+    }
+
+    pub fn fromJson(allocator: Allocator, json: []const u8) !ObjectMeta {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        var m: ObjectMeta = .{
+            .shard_size = @intCast(obj.get("shard_size").?.integer),
+            .original_size = @intCast(obj.get("original_size").?.integer),
+            .etag = undefined,
+            .content_type = "",
+            .last_modified = obj.get("last_modified").?.integer,
+            .encrypted = if (obj.get("encrypted")) |v| v.bool else false,
+        };
+        const etag_s = obj.get("etag").?.string;
+        if (etag_s.len != 32) return error.BadMeta;
+        @memcpy(&m.etag, etag_s);
+        const ct = obj.get("content_type").?.string;
+        m.content_type = try allocator.dupe(u8, ct);
+        return m;
+    }
+};
+
 fn shardPath(buf: []u8, bucket: []const u8, key: []const u8, idx: u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}/{s}/{s}/{d}.shard", .{ shards_root, bucket, key, idx });
 }
@@ -215,7 +257,46 @@ pub fn forEachLocalKey(
     }
 }
 
+/// True if this node currently holds at least one local shard file
+/// (`.simpaniz-shards/**/*.shard`). Used by the rebalance sweep to decide
+/// whether a `draining` node has finished emptying out and can be promoted
+/// to `removed`.
+pub fn hasAnyLocalShard(data_dir: std.fs.Dir, allocator: Allocator) !bool {
+    var shards_dir = data_dir.openDir(shards_root, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return false,
+        else => return e,
+    };
+    defer shards_dir.close();
+    var walker = try shards_dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.path, ".shard")) return true;
+    }
+    return false;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+test "ObjectMeta json round-trip" {
+    var m: ObjectMeta = .{
+        .shard_size = 1024,
+        .original_size = 4000,
+        .etag = "0123456789abcdef0123456789abcdef".*,
+        .content_type = "text/plain",
+        .last_modified = 1700000000,
+        .encrypted = false,
+    };
+    const j = try m.toJson(std.testing.allocator);
+    defer std.testing.allocator.free(j);
+
+    const round = try ObjectMeta.fromJson(std.testing.allocator, j);
+    defer std.testing.allocator.free(round.content_type);
+    try std.testing.expectEqual(m.shard_size, round.shard_size);
+    try std.testing.expectEqual(m.original_size, round.original_size);
+    try std.testing.expectEqualStrings(&m.etag, &round.etag);
+    try std.testing.expectEqualStrings(m.content_type, round.content_type);
+}
 
 test "shard round-trip" {
     var tmp = std.testing.tmpDir(.{});

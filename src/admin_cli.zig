@@ -29,7 +29,14 @@ pub fn planFromArgs(allocator: Allocator, args: []const []const u8, policy_file_
 
     if (std.mem.eql(u8, cmd, "info")) return .{ .method = .GET, .path = "/_admin/info" };
     if (std.mem.eql(u8, cmd, "config")) return .{ .method = .GET, .path = "/_admin/config" };
-    if (std.mem.eql(u8, cmd, "cluster")) return .{ .method = .GET, .path = "/_admin/cluster" };
+    if (std.mem.eql(u8, cmd, "cluster")) {
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "decommission")) {
+            if (args.len < 3) return error.MissingArgument;
+            const path = try std.fmt.allocPrint(allocator, "/_admin/cluster/decommission?node={s}", .{args[2]});
+            return .{ .method = .POST, .path = path };
+        }
+        return .{ .method = .GET, .path = "/_admin/cluster" };
+    }
 
     if (std.mem.eql(u8, cmd, "user")) {
         if (args.len < 2) return error.MissingArgument;
@@ -187,6 +194,7 @@ fn printUsage() void {
         \\  simpaniz admin policy get <name>
         \\  simpaniz admin policy set <name> <file>
         \\  simpaniz admin cluster
+        \\  simpaniz admin cluster decommission <node-id>
         \\  simpaniz admin config
         \\  simpaniz admin help
         \\
@@ -264,6 +272,17 @@ test "planFromArgs: cluster and config map to GET" {
     try std.testing.expectEqualStrings("/_admin/cluster", cluster_plan.path);
     const config_plan = try planFromArgs(arena.allocator(), &.{"config"}, null);
     try std.testing.expectEqualStrings("/_admin/config", config_plan.path);
+}
+
+test "planFromArgs: cluster decommission maps to POST with node query param" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const plan = try planFromArgs(arena.allocator(), &.{ "cluster", "decommission", "n1" }, null);
+    try std.testing.expectEqual(std.http.Method.POST, plan.method);
+    try std.testing.expectEqualStrings("/_admin/cluster/decommission?node=n1", plan.path);
+
+    try std.testing.expectError(error.MissingArgument, planFromArgs(arena.allocator(), &.{ "cluster", "decommission" }, null));
 }
 
 test "planFromArgs: unknown command errors" {
