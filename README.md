@@ -28,7 +28,8 @@ See [`COMPATIBILITY.md`](./COMPATIBILITY.md) for the S3 operation matrix and
   policy evaluation (explicit Deny wins, then Allow, default-deny for
   authenticated non-root users) enforced on every request.
 - **In-process TLS 1.3** — no reverse proxy required; see
-  `SIMPANIZ_TLS_CERT`/`SIMPANIZ_TLS_KEY` below.
+  `SIMPANIZ_TLS_CERT`/`SIMPANIZ_TLS_KEY` below, or use zero-config ACME
+  (`SIMPANIZ_TLS_ACME`) for a Let's Encrypt certificate with no manual setup.
 - **Event notifications** — webhook delivery of S3-event-shaped JSON on
   object create/delete; see `SIMPANIZ_NOTIFY_WEBHOOK` below.
 - **Streaming I/O** — PUT writes are streamed to disk (no full-body
@@ -89,6 +90,10 @@ All configuration is via environment variables.
 | `SIMPANIZ_LIFECYCLE_INTERVAL_S` | `0`         | Lifecycle sweeper interval in seconds. `0` disables. Expires objects per `?lifecycle` rules. |
 | `SIMPANIZ_TLS_CERT`          | *(empty)*      | Path to TLS certificate (PEM). Setting this enables in-process TLS 1.3 — `curl https://...` works with no reverse proxy. Requires `SIMPANIZ_TLS_KEY` too (setting only one refuses startup). Cert must be ECDSA P-256. |
 | `SIMPANIZ_TLS_KEY`           | *(empty)*      | Path to TLS private key (PEM, PKCS#8 or SEC1 P-256).       |
+| `SIMPANIZ_TLS_ACME`          | *(empty)*      | Domain name for zero-config ACME (Let's Encrypt) TLS — obtains and auto-renews an ECDSA P-256 certificate with no manual setup. Mutually exclusive with `SIMPANIZ_TLS_CERT`/`SIMPANIZ_TLS_KEY`. See "Zero-config TLS (ACME)" below. |
+| `SIMPANIZ_ACME_DIRECTORY`    | `https://acme-v02.api.letsencrypt.org/directory` | ACME directory URL. Point at Let's Encrypt's staging directory for testing (avoids production rate limits). |
+| `SIMPANIZ_ACME_CONTACT`      | *(empty)*      | Optional ACME account contact, e.g. `mailto:ops@example.com`. |
+| `SIMPANIZ_ACME_HTTP_PORT`    | `80`           | Port the HTTP-01 challenge listener binds on while proving domain control. |
 | `SIMPANIZ_NOTIFY_WEBHOOK`    | *(empty)*      | Webhook URL for event notifications. When set, per-bucket `?notification` config (`PutBucketNotificationConfiguration`) triggers async best-effort HTTP POST of S3-event-shaped JSON on object create/delete. |
 | `SIMPANIZ_NODE_ID`           | *(empty)*      | This node's id when running in cluster mode (e.g. `node-1`). Empty disables cluster mode. |
 | `SIMPANIZ_PEERS`             | *(empty)*      | Comma list of `id@host:port` peers; must include this node. Required in cluster mode. |
@@ -116,6 +121,28 @@ All configuration is via environment variables.
 | `SIMPANIZ_OIDC_DEFAULT_POLICY` | *(empty)*    | Optional named policy file (under `.simpaniz-iam/policies/`) applied when the JWT carries no policy claim. |
 | `SIMPANIZ_ADMIN_ENDPOINT`    | `http://127.0.0.1:9000` | Endpoint the `simpaniz admin` CLI targets. |
 | `SIMPANIZ_METRICS_SAMPLE_S`  | `10`           | Background sampler period (seconds) for the in-process 24h metric history that powers the console's Metrics tab. `0` disables the sampler; `/_dashboard/api/*` still answers, `/summary` from live counters, `/series` with no points. |
+
+### Zero-config TLS (ACME)
+
+Set `SIMPANIZ_TLS_ACME=example.com` and Simpaniz obtains and auto-renews an
+ECDSA P-256 certificate from Let's Encrypt with no manual `certbot`/reverse-proxy
+setup — a differentiator MinIO doesn't have (MinIO expects TLS termination or
+manual cert placement). Requirements: port 80 reachable from the internet for
+the HTTP-01 challenge (or set `SIMPANIZ_ACME_HTTP_PORT` and forward it), and
+DNS for the domain already pointing at this host.
+
+On boot, Simpaniz runs the ACME v2 (RFC 8555) flow once synchronously — account
+key + domain key + certificate are persisted under
+`<DATA_DIR>/.simpaniz-acme/` — then starts the TLS listener from the issued
+cert. A background daemon checks daily and re-issues whenever the certificate
+is within 30 days of expiring, hot-swapping the new cert/key pair into the
+running listener with no restart and no dropped connections; if a renewal
+attempt fails, the server keeps serving the current certificate and retries
+the next day.
+
+`SIMPANIZ_TLS_ACME` is mutually exclusive with `SIMPANIZ_TLS_CERT`/`SIMPANIZ_TLS_KEY`
+(manual cert/key). Point `SIMPANIZ_ACME_DIRECTORY` at Let's Encrypt's staging
+directory while testing to avoid production rate limits.
 
 ## Endpoints
 

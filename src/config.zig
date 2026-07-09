@@ -45,6 +45,16 @@ heal_interval_s: u64,
 tls_cert_path: []const u8,
 /// Path to TLS private key (PEM). See `tls_cert_path`.
 tls_key_path: []const u8,
+/// Domain name for zero-config ACME (Let's Encrypt) certificate issuance and
+/// auto-renewal. Mutually exclusive with `tls_cert_path`/`tls_key_path`
+/// (checked in `main.zig`, same style as the cert/key pairing check).
+tls_acme_domain: []const u8 = "",
+/// ACME directory URL. Defaults to Let's Encrypt production.
+acme_directory_url: []const u8 = "https://acme-v02.api.letsencrypt.org/directory",
+/// Optional ACME account contact, e.g. `mailto:ops@example.com`.
+acme_contact: []const u8 = "",
+/// Port the HTTP-01 challenge listener binds while proving domain control.
+acme_http_port: u16 = 80,
 /// When true, a GET on a tiered (cold) object rehydrates it: the fetched
 /// bytes are written back to hot storage and the cold copy is removed.
 /// Default false (GET stays a transparent, non-mutating read).
@@ -92,6 +102,10 @@ pub fn load(allocator: Allocator) Self {
         .auth_required = access_key.len > 0,
         .tls_cert_path = getEnv(a, "SIMPANIZ_TLS_CERT", ""),
         .tls_key_path = getEnv(a, "SIMPANIZ_TLS_KEY", ""),
+        .tls_acme_domain = getEnv(a, "SIMPANIZ_TLS_ACME", ""),
+        .acme_directory_url = getEnv(a, "SIMPANIZ_ACME_DIRECTORY", "https://acme-v02.api.letsencrypt.org/directory"),
+        .acme_contact = getEnv(a, "SIMPANIZ_ACME_CONTACT", ""),
+        .acme_http_port = getEnvU16(a, "SIMPANIZ_ACME_HTTP_PORT", 80),
         .tier_rehydrate = getEnvBool(a, "SIMPANIZ_TIER_REHYDRATE", false),
     };
 }

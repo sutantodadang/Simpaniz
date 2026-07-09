@@ -18,6 +18,7 @@ const ui = @import("ui.zig");
 const iam = @import("iam.zig");
 const events = @import("events.zig");
 const tls_server = @import("tls_server.zig");
+const acme = @import("acme.zig");
 const index_mod = @import("index.zig");
 const tiering_mod = @import("tiering.zig");
 const sts = @import("sts.zig");
@@ -173,7 +174,12 @@ pub const Context = struct {
     cluster: ?*cluster.ClusterRuntime = null,
     iam: *iam.Store,
     notifier: ?*events.Notifier = null,
-    tls: ?*tls_server.ServerContext = null,
+    /// Holds the active TLS cert/key pair. A plain `?*tls_server.ServerContext`
+    /// would be simpler, but ACME renewal needs to hot-swap the pair without
+    /// tearing down live connections, so the indirection lives in `acme.zig`
+    /// (see `acme.TlsHolder`) — a no-op wrapper when TLS is manually
+    /// configured (never swapped).
+    tls: ?*acme.TlsHolder = null,
     /// Persistent object-listing index, single-node only (null in cluster
     /// mode — cluster listing still walks the shard-local metadata).
     index: ?*index_mod.Manager = null,
@@ -327,8 +333,8 @@ fn handleConnection(stream: std.net.Stream, ctx: Context, permits: *Permits) voi
     defer permits.release();
     defer stream.close();
 
-    if (ctx.tls) |tsrv| {
-        handleTlsConnection(stream, ctx, tsrv);
+    if (ctx.tls) |holder| {
+        handleTlsConnection(stream, ctx, holder.current());
         return;
     }
 
