@@ -36,6 +36,8 @@ const Orchestrator = orchestrator_mod.Orchestrator;
 const runtime_mod = @import("runtime.zig");
 const membership_mod = @import("membership.zig");
 const config_mod = @import("config.zig");
+const list_index_mod = @import("list_index.zig");
+const types_mod = @import("../storage/types.zig");
 
 pub const Stats = struct {
     scanned: u64 = 0,
@@ -248,6 +250,7 @@ const DiskMultiTransport = struct {
             .appendShardChunk = appendChunk,
             .getShardRange = getRange,
             .statShard = statShardFn,
+            .listMeta = listMetaFn,
         } };
     }
 
@@ -283,6 +286,16 @@ const DiskMultiTransport = struct {
     }
     fn statShardFn(ctx: *anyopaque, node: usize, sid: ShardId) anyerror!u64 {
         return disk.statShard(try dirOf(ctx, node), sid.bucket, sid.key, sid.index);
+    }
+    /// Builds a fresh `list_index.Index` over the node's dir on every call
+    /// (bootstrap is idempotent/incremental — see `index.zig`'s
+    /// `tryOpenExisting`) — fine for tests, keeps `DiskMultiTransport`
+    /// stateless like its other methods.
+    fn listMetaFn(ctx: *anyopaque, node: usize, bucket: []const u8, opts: types_mod.ListOpts, allocator: Allocator) anyerror!types_mod.ListPage {
+        const dir = try dirOf(ctx, node);
+        var idx = try list_index_mod.Index.init(allocator, dir);
+        defer idx.deinit();
+        return idx.list(allocator, bucket, opts);
     }
 };
 

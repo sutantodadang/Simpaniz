@@ -13,6 +13,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const disk = @import("disk_store.zig");
+const types = @import("../storage/types.zig");
+const xml = @import("../xml.zig");
+const util = @import("../util.zig");
 
 pub const ShardId = struct {
     bucket: []const u8,
@@ -32,6 +36,11 @@ pub const Transport = struct {
         putMeta: *const fn (ctx: *anyopaque, node: usize, bucket: []const u8, key: []const u8, data: []const u8) anyerror!void,
         getMeta: *const fn (ctx: *anyopaque, node: usize, bucket: []const u8, key: []const u8, allocator: Allocator) anyerror!?[]u8,
         deleteMeta: *const fn (ctx: *anyopaque, node: usize, bucket: []const u8, key: []const u8) anyerror!void,
+        /// One page of a node's LOCAL sorted meta-key listing (no delimiter
+        /// collapsing — that happens only after the cross-node merge in
+        /// `list_merge.zig`). Used to build cluster-wide `ListObjectsV2`
+        /// without any node ever FS-walking another node's disk.
+        listMeta: *const fn (ctx: *anyopaque, node: usize, bucket: []const u8, opts: types.ListOpts, allocator: Allocator) anyerror!types.ListPage,
         /// Append one stripe's worth of bytes to shard `sid` at logical
         /// position `seq` (0-based stripe index). Idempotent: replaying the
         /// same `seq` with identical `data.len` after it already landed is a
@@ -73,6 +82,9 @@ pub const Transport = struct {
     pub inline fn deleteMeta(self: Transport, node: usize, bucket: []const u8, key: []const u8) !void {
         return self.vtable.deleteMeta(self.ctx, node, bucket, key);
     }
+    pub inline fn listMeta(self: Transport, node: usize, bucket: []const u8, opts: types.ListOpts, allocator: Allocator) !types.ListPage {
+        return self.vtable.listMeta(self.ctx, node, bucket, opts, allocator);
+    }
 };
 
 /// One-directory-per-node transport, useful for tests and single-process
@@ -96,6 +108,7 @@ pub const LocalTransport = struct {
             .appendShardChunk = appendChunk,
             .getShardRange = getRange,
             .statShard = statShardFn,
+            .listMeta = listMeta,
         } };
     }
 
@@ -107,6 +120,10 @@ pub const LocalTransport = struct {
 
     fn metaPathFor(buf: []u8, node: usize, bucket: []const u8, key: []const u8) ![]const u8 {
         return std.fmt.bufPrint(buf, "node{d}/_meta/{s}/{s}.meta", .{ node, bucket, key });
+    }
+
+    fn metaDirFor(buf: []u8, node: usize, bucket: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "node{d}/_meta/{s}", .{ node, bucket });
     }
 
     fn put(ctx: *anyopaque, node: usize, sid: ShardId, data: []const u8) anyerror!void {
@@ -241,6 +258,115 @@ pub const LocalTransport = struct {
         self.root.deleteFile(p) catch |e| switch (e) {
             error.FileNotFound => {},
             else => return e,
+        };
+    }
+
+    /// Test/simulation-only listing: a plain FS-walk-and-sort over
+    /// `node{N}/_meta/<bucket>/` (no LSM index, no delimiter collapsing —
+    /// mirrors what the real `list_index.Index.list()` returns: a flat,
+    /// sorted, prefix/bound-filtered page). Fine for tests since
+    /// `LocalTransport` is only ever used with small in-memory fixtures.
+    fn listMeta(ctx: *anyopaque, node: usize, bucket: []const u8, opts: types.ListOpts, allocator: Allocator) anyerror!types.ListPage {
+        const self: *LocalTransport = @ptrCast(@alignCast(ctx));
+        if (node >= self.node_count) return error.InvalidNode;
+        var pb: [512]u8 = undefined;
+        const dir_path = try metaDirFor(&pb, node, bucket);
+        var bd = self.root.openDir(dir_path, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => return .{ .objects = &.{}, .common_prefixes = &.{}, .is_truncated = false, .next_continuation_token = "" },
+            else => return e,
+        };
+        defer bd.close();
+
+        // `path` is the full allocation (freed below); `key` is a slice
+        // into it with the `.meta` suffix stripped — never freed directly
+        // (freeing a truncated slice of a GPA allocation is invalid).
+        const Item = struct { path: []u8, key: []const u8, meta: disk.ObjectMeta };
+        var all = std.ArrayList(Item){};
+        defer {
+            for (all.items) |it| {
+                allocator.free(it.path);
+                allocator.free(it.meta.content_type);
+            }
+            all.deinit(allocator);
+        }
+
+        var walker = try bd.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.path, ".meta")) continue;
+            const normalized = try allocator.dupe(u8, entry.path);
+            for (normalized) |*c| if (c.* == '\\') {
+                c.* = '/';
+            };
+            const key = normalized[0 .. normalized.len - ".meta".len];
+
+            var f = bd.openFile(entry.path, .{}) catch {
+                allocator.free(normalized);
+                continue;
+            };
+            defer f.close();
+            const stat = try f.stat();
+            const buf = try allocator.alloc(u8, stat.size);
+            defer allocator.free(buf);
+            const n = try f.readAll(buf);
+            if (n != buf.len) {
+                allocator.free(normalized);
+                continue;
+            }
+            const meta = disk.ObjectMeta.fromJson(allocator, buf) catch {
+                allocator.free(normalized);
+                continue;
+            };
+            try all.append(allocator, .{ .path = normalized, .key = key, .meta = meta });
+        }
+
+        std.mem.sort(Item, all.items, {}, struct {
+            fn lt(_: void, a: Item, b: Item) bool {
+                return std.mem.lessThan(u8, a.key, b.key);
+            }
+        }.lt);
+
+        var bound: []const u8 = opts.prefix;
+        var bound_inclusive = true;
+        if (opts.continuation_token.len > 0) {
+            bound = opts.continuation_token;
+        } else if (opts.start_after.len > 0) {
+            bound = opts.start_after;
+            bound_inclusive = false;
+        }
+
+        const max = if (opts.max_keys == 0 or opts.max_keys > 1000) 1000 else opts.max_keys;
+        var objects = std.ArrayList(xml.ObjectInfo){};
+        var truncated = false;
+        var next_token: []const u8 = "";
+
+        for (all.items) |item| {
+            if (opts.prefix.len > 0 and !std.mem.startsWith(u8, item.key, opts.prefix)) continue;
+            if (bound.len > 0) {
+                const cmp_lt = std.mem.lessThan(u8, item.key, bound);
+                const cmp_eq = std.mem.eql(u8, item.key, bound);
+                if (cmp_lt or (cmp_eq and !bound_inclusive)) continue;
+            }
+            if (objects.items.len >= max) {
+                truncated = true;
+                next_token = try allocator.dupe(u8, item.key);
+                break;
+            }
+            var lm_buf: [32]u8 = undefined;
+            try objects.append(allocator, .{
+                .key = try allocator.dupe(u8, item.key),
+                .last_modified = try allocator.dupe(u8, util.formatIso8601(&lm_buf, @as(i128, item.meta.last_modified) * std.time.ns_per_s)),
+                .etag = try std.fmt.allocPrint(allocator, "\"{s}\"", .{item.meta.etag}),
+                .size = item.meta.original_size,
+            });
+        }
+
+        return .{
+            .objects = try objects.toOwnedSlice(allocator),
+            .common_prefixes = &.{},
+            .is_truncated = truncated,
+            .next_continuation_token = next_token,
         };
     }
 };

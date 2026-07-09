@@ -21,6 +21,10 @@ const Peer = config_mod.Peer;
 const disk = @import("disk_store.zig");
 const membership_mod = @import("membership.zig");
 const Membership = membership_mod.Membership;
+const list_index_mod = @import("list_index.zig");
+const list_wire = @import("list_wire.zig");
+const types = @import("../storage/types.zig");
+const util = @import("../util.zig");
 
 pub const HttpTransport = struct {
     allocator: Allocator,
@@ -31,6 +35,11 @@ pub const HttpTransport = struct {
     /// `peerOf` to resolve host:port for node indices beyond the static
     /// `cfg.peers` list — i.e. nodes that joined dynamically at runtime.
     membership: ?*Membership = null,
+    /// Set after construction (see `ClusterRuntime.init`), mirroring
+    /// `membership` above. Backs the self-branch of `listMetaVT` (local
+    /// index query, no network hop) and the index-maintenance hooks in
+    /// `putMetaVT`/`deleteMetaVT`'s self-branches.
+    list_index: ?*list_index_mod.Index = null,
 
     pub const Metrics = struct {
         peer_unreachable: std.atomic.Value(u64) = .{ .raw = 0 },
@@ -61,6 +70,7 @@ pub const HttpTransport = struct {
             .appendShardChunk = appendShardChunkVT,
             .getShardRange = getShardRangeVT,
             .statShard = statShardVT,
+            .listMeta = listMetaVT,
         } };
     }
 
@@ -251,9 +261,26 @@ pub const HttpTransport = struct {
         }
     }
 
+    /// Best-effort: parse the just-written `.meta` JSON and feed it into the
+    /// local listing index. Never fails the write path — logs and returns
+    /// on parse failure.
+    fn noteIndexUpsert(self: *HttpTransport, bucket: []const u8, key: []const u8, data: []const u8) void {
+        const li = self.list_index orelse return;
+        const meta = disk.ObjectMeta.fromJson(self.allocator, data) catch |e| {
+            std.log.warn("cluster list-index: parse meta failed bucket={s} key={s} err={any}", .{ bucket, key, e });
+            return;
+        };
+        defer self.allocator.free(meta.content_type);
+        li.noteUpsert(bucket, key, meta.original_size, @as(i128, meta.last_modified) * std.time.ns_per_s, &meta.etag);
+    }
+
     fn putMetaVT(ctx: *anyopaque, node: usize, bucket: []const u8, key: []const u8, data: []const u8) anyerror!void {
         const self: *HttpTransport = @ptrCast(@alignCast(ctx));
-        if (self.isSelf(node)) return disk.putMeta(self.data_dir, bucket, key, data);
+        if (self.isSelf(node)) {
+            try disk.putMeta(self.data_dir, bucket, key, data);
+            self.noteIndexUpsert(bucket, key, data);
+            return;
+        }
         var pb: [512]u8 = undefined;
         const path = try std.fmt.bufPrint(&pb, "/_simpaniz/meta/{s}/{s}", .{ bucket, key });
         const peer = try self.peerOf(node);
@@ -288,11 +315,46 @@ pub const HttpTransport = struct {
 
     fn deleteMetaVT(ctx: *anyopaque, node: usize, bucket: []const u8, key: []const u8) anyerror!void {
         const self: *HttpTransport = @ptrCast(@alignCast(ctx));
-        if (self.isSelf(node)) return disk.deleteMeta(self.data_dir, bucket, key);
+        if (self.isSelf(node)) {
+            try disk.deleteMeta(self.data_dir, bucket, key);
+            if (self.list_index) |li| li.noteDelete(bucket, key);
+            return;
+        }
         var pb: [512]u8 = undefined;
         const path = try std.fmt.bufPrint(&pb, "/_simpaniz/meta/{s}/{s}", .{ bucket, key });
         const peer = try self.peerOf(node);
         _ = try self.doRequest(peer, "DELETE", path, "", false);
+    }
+
+    /// One page of a node's local sorted meta-key listing (see
+    /// `Transport.VTable.listMeta`). Self-node short-circuits straight to
+    /// the local index; a peer is queried over `/_simpaniz/list`.
+    fn listMetaVT(ctx: *anyopaque, node: usize, bucket: []const u8, opts: types.ListOpts, allocator: Allocator) anyerror!types.ListPage {
+        const self: *HttpTransport = @ptrCast(@alignCast(ctx));
+        if (self.isSelf(node)) {
+            const li = self.list_index orelse return error.ListIndexNotConfigured;
+            return li.list(allocator, bucket, opts);
+        }
+
+        const prefix_enc = try util.awsUriEncode(allocator, opts.prefix, true);
+        const ct_enc = try util.awsUriEncode(allocator, opts.continuation_token, true);
+        const sa_enc = try util.awsUriEncode(allocator, opts.start_after, true);
+
+        var pb: [3072]u8 = undefined;
+        const path = try std.fmt.bufPrint(
+            &pb,
+            "/_simpaniz/list?bucket={s}&prefix={s}&continuation_token={s}&start_after={s}&max={d}",
+            .{ bucket, prefix_enc, ct_enc, sa_enc, opts.max_keys },
+        );
+        const peer = try self.peerOf(node);
+        const r = try self.doRequest(peer, "GET", path, "", true);
+        switch (r) {
+            .not_found => return error.PeerError,
+            .ok => |bytes| {
+                defer self.allocator.free(bytes);
+                return try list_wire.decodeListPage(allocator, bytes);
+            },
+        }
     }
 
     // ── HTTP/1.1 client ───────────────────────────────────────────────────

@@ -20,6 +20,9 @@ const heal_mod = @import("cluster/heal.zig");
 const replication_mod = @import("cluster/replication.zig");
 const membership_mod = @import("cluster/membership.zig");
 const rebalance_mod = @import("cluster/rebalance.zig");
+const list_index_mod = @import("cluster/list_index.zig");
+const list_wire_mod = @import("cluster/list_wire.zig");
+const list_merge_mod = @import("cluster/list_merge.zig");
 
 // ── Reed-Solomon erasure coding ─────────────────────────────────────────────
 pub const Codec = reed_solomon_mod.Codec;
@@ -71,4 +74,7 @@ test {
     std.testing.refAllDecls(replication_mod);
     std.testing.refAllDecls(membership_mod);
     std.testing.refAllDecls(rebalance_mod);
+    std.testing.refAllDecls(list_index_mod);
+    std.testing.refAllDecls(list_wire_mod);
+    std.testing.refAllDecls(list_merge_mod);
 }

@@ -5,13 +5,23 @@
 //! Routes:
 //!   PUT|GET|DELETE /_simpaniz/shards/<bucket>/<key>/<idx>
 //!   PUT|GET|DELETE /_simpaniz/meta/<bucket>/<key>
-//!   GET            /_simpaniz/ping                 membership snapshot (probe + gossip piggyback)
+//!   GET            /_simpaniz/list                  one page of this node's local sorted meta-key listing
+//!   GET            /_simpaniz/ping                  membership snapshot (probe + gossip piggyback)
 //!   POST           /_simpaniz/join                  {"id","host","port"} -> announce + adopt
 //!
 //! Stripe-streaming shard sub-ops (query string on the shard route above):
 //!   PUT  /_simpaniz/shards/<bucket>/<key>/<idx>?seq=<n>           append chunk `seq`
 //!   GET  /_simpaniz/shards/<bucket>/<key>/<idx>?offset=<o>&len=<n> ranged read
 //!   GET  /_simpaniz/shards/<bucket>/<key>/<idx>?stat=1             body = decimal length
+//!
+//! `/_simpaniz/list` query string (all optional except `bucket`):
+//!   bucket=<b>&prefix=<p>&continuation_token=<t>&start_after=<k>&max=<n>
+//! (`prefix`/`continuation_token`/`start_after` are percent-encoded query
+//! values, matching the public ListObjectsV2 API's own bound semantics:
+//! `continuation_token` INCLUSIVE, `start_after` EXCLUSIVE — see
+//! `list_merge.zig`, which is the only caller and relies on both being
+//! supported, not just an exclusive-only `after`.) Response body is JSON,
+//! see `list_wire.zig`.
 //!
 //! Notes:
 //!   - <key> may itself contain '/'; the trailing path segment after the
@@ -24,12 +34,16 @@ const Allocator = std.mem.Allocator;
 const http = @import("../http.zig");
 const disk = @import("disk_store.zig");
 const storage = @import("../storage.zig");
+const util = @import("../util.zig");
 const membership_mod = @import("membership.zig");
 const Membership = membership_mod.Membership;
+const list_index_mod = @import("list_index.zig");
+const list_wire = @import("list_wire.zig");
 
 const shards_prefix = "/_simpaniz/shards/";
 const meta_prefix = "/_simpaniz/meta/";
 const bucket_prefix = "/_simpaniz/bucket/";
+const list_path = "/_simpaniz/list";
 const ping_path = "/_simpaniz/ping";
 const join_path = "/_simpaniz/join";
 
@@ -51,6 +65,7 @@ pub fn handle(
     cluster_secret: []const u8,
     max_body_bytes: usize,
     membership: ?*Membership,
+    list_index: ?*list_index_mod.Index,
 ) http.Response {
     // Auth.
     const auth = req.header("x-simpaniz-cluster-auth") orelse "";
@@ -70,6 +85,13 @@ pub fn handle(
     if (std.mem.eql(u8, req.path, join_path)) {
         return switch (req.method) {
             .POST => doJoin(req, a, membership, max_body_bytes),
+            else => methodNotAllowed(),
+        };
+    }
+
+    if (std.mem.eql(u8, req.path, list_path)) {
+        return switch (req.method) {
+            .GET => doListMeta(a, req.query, list_index),
             else => methodNotAllowed(),
         };
     }
@@ -118,9 +140,9 @@ pub fn handle(
         const key = rest[first_slash + 1 ..];
 
         return switch (req.method) {
-            .PUT => doPutMeta(req, a, data_dir, bucket, key, max_body_bytes),
+            .PUT => doPutMeta(req, a, data_dir, bucket, key, max_body_bytes, list_index),
             .GET => doGetMeta(a, data_dir, bucket, key),
-            .DELETE => doDelMeta(data_dir, bucket, key),
+            .DELETE => doDelMeta(data_dir, bucket, key, list_index),
             else => methodNotAllowed(),
         };
     }
@@ -275,9 +297,20 @@ fn doDelShard(dir: std.fs.Dir, bucket: []const u8, key: []const u8, idx: u8) htt
     return ok();
 }
 
-fn doPutMeta(req: *http.Request, a: Allocator, dir: std.fs.Dir, bucket: []const u8, key: []const u8, max: usize) http.Response {
+fn doPutMeta(req: *http.Request, a: Allocator, dir: std.fs.Dir, bucket: []const u8, key: []const u8, max: usize, list_index: ?*list_index_mod.Index) http.Response {
     const body = req.readBodyAlloc(a, max) catch return serverError();
     disk.putMeta(dir, bucket, key, body) catch return serverError();
+    // Best-effort: keep this node's local listing index in sync with the
+    // meta file it just received (this is the code path that fires when a
+    // PEER pushes meta at us — the local-self-write path is hooked in
+    // `http_transport.zig`'s `putMetaVT`). Never fails the write.
+    if (list_index) |li| {
+        if (disk.ObjectMeta.fromJson(a, body)) |meta| {
+            li.noteUpsert(bucket, key, meta.original_size, @as(i128, meta.last_modified) * std.time.ns_per_s, &meta.etag);
+        } else |e| {
+            std.log.warn("cluster list-index: parse meta failed bucket={s} key={s} err={any}", .{ bucket, key, e });
+        }
+    }
     return ok();
 }
 
@@ -292,9 +325,40 @@ fn doGetMeta(a: Allocator, dir: std.fs.Dir, bucket: []const u8, key: []const u8)
     return notFound();
 }
 
-fn doDelMeta(dir: std.fs.Dir, bucket: []const u8, key: []const u8) http.Response {
+fn doDelMeta(dir: std.fs.Dir, bucket: []const u8, key: []const u8, list_index: ?*list_index_mod.Index) http.Response {
     disk.deleteMeta(dir, bucket, key) catch return serverError();
+    if (list_index) |li| li.noteDelete(bucket, key);
     return ok();
+}
+
+/// GET /_simpaniz/list?bucket=<b>&prefix=<p>&continuation_token=<t>&start_after=<k>&max=<n>
+/// One page of this node's LOCAL sorted meta-key listing (delimiter always
+/// empty — collapsing into CommonPrefixes happens only after the cross-node
+/// merge, see `list_merge.zig`, the only caller). JSON body via
+/// `list_wire.encodeListPage`.
+fn doListMeta(a: Allocator, query: []const u8, list_index: ?*list_index_mod.Index) http.Response {
+    const li = list_index orelse return serverError();
+    const bucket = queryParam(query, "bucket") orelse return badRequest("missing bucket");
+    const prefix_enc = queryParam(query, "prefix") orelse "";
+    const ct_enc = queryParam(query, "continuation_token") orelse "";
+    const sa_enc = queryParam(query, "start_after") orelse "";
+    const max_str = queryParam(query, "max") orelse "1000";
+    const max_keys = std.fmt.parseInt(usize, max_str, 10) catch 1000;
+
+    const prefix = util.urlDecode(a, prefix_enc) catch prefix_enc;
+    const ct = util.urlDecode(a, ct_enc) catch ct_enc;
+    const sa = util.urlDecode(a, sa_enc) catch sa_enc;
+
+    const page = li.list(a, bucket, .{
+        .prefix = prefix,
+        .delimiter = "",
+        .continuation_token = ct,
+        .start_after = sa,
+        .max_keys = if (max_keys == 0 or max_keys > 1000) 1000 else max_keys,
+    }) catch return serverError();
+
+    const body = list_wire.encodeListPage(a, page) catch return serverError();
+    return .{ .status = 200, .status_text = "OK", .content_type = "application/json", .body = .{ .bytes = body } };
 }
 
 test "matches" {

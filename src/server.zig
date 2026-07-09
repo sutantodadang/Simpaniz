@@ -413,7 +413,7 @@ fn serveHttp(in: *Io.Reader, out: *Io.Writer, ctx: Context) void {
         // secret in X-Simpaniz-Cluster-Auth header.
         if (ctx.cluster != null and cluster.isInternalPath(request.path)) {
             const cr = ctx.cluster.?;
-            const resp = cluster.internalHandler(&request, ctx.data_dir, cr.config.cluster_secret, ctx.config.max_body_bytes, cr.membership);
+            const resp = cluster.internalHandler(&request, ctx.data_dir, cr.config.cluster_secret, ctx.config.max_body_bytes, cr.membership, &cr.list_index);
             writeAndLog(out, &request, &resp, request_id, start_ns, ctx);
             drainBody(&request) catch return;
             continue;

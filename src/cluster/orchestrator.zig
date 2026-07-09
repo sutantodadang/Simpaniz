@@ -33,6 +33,7 @@ const rendezvous = @import("rendezvous.zig");
 const transport_mod = @import("transport.zig");
 const membership_mod = @import("membership.zig");
 const config_mod = @import("config.zig");
+const types_mod = @import("../storage/types.zig");
 
 pub const ShardId = transport_mod.ShardId;
 pub const Transport = transport_mod.Transport;
@@ -907,6 +908,7 @@ const CountingTransport = struct {
             .appendShardChunk = appendChunk,
             .getShardRange = getRange,
             .statShard = statShardFn,
+            .listMeta = listMeta,
         } };
     }
     fn put(ctx: *anyopaque, node: usize, sid: ShardId, data: []const u8) anyerror!void {
@@ -945,6 +947,10 @@ const CountingTransport = struct {
         const self: *CountingTransport = @ptrCast(@alignCast(ctx));
         self.stat_counts[node] += 1;
         return self.inner.statShard(node, sid);
+    }
+    fn listMeta(ctx: *anyopaque, node: usize, bucket: []const u8, opts: types_mod.ListOpts, allocator: Allocator) anyerror!types_mod.ListPage {
+        const self: *CountingTransport = @ptrCast(@alignCast(ctx));
+        return self.inner.listMeta(node, bucket, opts, allocator);
     }
 };
 
