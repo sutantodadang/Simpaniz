@@ -567,6 +567,14 @@ pub fn getObject(ctx: HandlerContext, bucket: []const u8, key: []const u8, req: 
         const tmp_name = std.fmt.bufPrint(&tmp_name_buf, "{s}/cold-{s}", .{ storage_paths.tmp_dir, hex_buf }) catch return internal(ctx, key);
         bd.writeFile(.{ .sub_path = tmp_name, .data = cold_bytes }) catch return internal(ctx, key);
         file = bd.openFile(tmp_name, .{}) catch return internal(ctx, key);
+
+        // Optional rehydration: promote the object back to hot storage so
+        // future GETs skip the cold round trip. Best-effort — any failure
+        // is logged inside `rehydrate` and this GET still serves `file`
+        // (the spooled cold bytes) regardless of the outcome.
+        if (ctx.config) |cfg| {
+            if (cfg.tier_rehydrate) tc.rehydrate(bd, ctx.allocator, bucket, key, cold_bytes);
+        }
     }
 
     // Conditional headers.

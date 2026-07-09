@@ -18,15 +18,20 @@
 //! HEAD in handlers.zig) spool them to a temp file so the existing
 //! file-based body/range/decrypt machinery keeps working unchanged.
 //!
-//! ponytail: no rehydration policy yet — GET always re-fetches from cold on
-//! every request rather than restoring the object locally.
+//! When `SIMPANIZ_TIER_REHYDRATE` is enabled, `rehydrate` additionally
+//! writes the fetched bytes back to hot storage and clears the stub/cold
+//! marker after a GET, so the object goes back to being served locally
+//! without further round trips. Rehydration is best-effort: failures are
+//! logged and never fail the GET that triggered them.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Dir = std.fs.Dir;
 
 const auth = @import("auth.zig");
 const internal = @import("storage/internal.zig");
+const paths = @import("storage/paths.zig");
 const s3_client = @import("s3_client.zig");
+const util = @import("util.zig");
 
 pub const Mode = enum { off, local, remote };
 
@@ -146,6 +151,112 @@ pub const Tiering = struct {
             },
             .remote => try self.fetchRemote(allocator, bucket, key),
         };
+    }
+
+    /// Best-effort promotion of a cold object back to hot storage after a
+    /// GET (only called when `SIMPANIZ_TIER_REHYDRATE` is enabled). Writes
+    /// `data` (already fetched by `fetchCold`) into `bd`/`key` atomically,
+    /// clears the `tiered` marker in the metadata sidecar, and deletes the
+    /// cold copy. Any failure is logged and swallowed — the caller's GET
+    /// already has `data` and must not fail because promotion did.
+    pub fn rehydrate(self: *Tiering, bd: Dir, allocator: Allocator, bucket: []const u8, key: []const u8, data: []const u8) void {
+        self.rehydrateInner(bd, allocator, bucket, key, data) catch |e| {
+            std.log.warn("tiering: rehydrate failed for {s}/{s}: {}", .{ bucket, key, e });
+        };
+    }
+
+    fn rehydrateInner(self: *Tiering, bd: Dir, allocator: Allocator, bucket: []const u8, key: []const u8, data: []const u8) !void {
+        // Atomic write into hot storage: tmp file + fsync + rename, mirroring
+        // the PUT path in storage/objects.zig.
+        if (std.fs.path.dirname(key)) |parent| bd.makePath(parent) catch {};
+
+        var rand_bytes: [12]u8 = undefined;
+        std.crypto.random.bytes(&rand_bytes);
+        var hex_buf: [24]u8 = undefined;
+        util.hexEncodeBuf(&rand_bytes, &hex_buf);
+        var tmp_name_buf: [96]u8 = undefined;
+        const tmp_name = try std.fmt.bufPrint(&tmp_name_buf, "{s}/rehydrate-{s}", .{ paths.tmp_dir, hex_buf });
+
+        var tmp_file = try bd.createFile(tmp_name, .{ .read = false, .truncate = true, .exclusive = true });
+        var write_buf: [64 * 1024]u8 = undefined;
+        var fw = tmp_file.writer(&write_buf);
+        fw.interface.writeAll(data) catch |e| {
+            tmp_file.close();
+            bd.deleteFile(tmp_name) catch {};
+            return e;
+        };
+        fw.interface.flush() catch |e| {
+            tmp_file.close();
+            bd.deleteFile(tmp_name) catch {};
+            return e;
+        };
+        tmp_file.sync() catch {};
+        tmp_file.close();
+
+        bd.rename(tmp_name, key) catch |e| {
+            bd.deleteFile(tmp_name) catch {};
+            return e;
+        };
+        internal.syncDir(bd) catch {};
+
+        // Clear the stub/cold marker; ETag, content-type, and SSE fields are
+        // read from the existing sidecar and rewritten unchanged.
+        var meta = try internal.readMetadata(bd, allocator, key);
+        defer freeObjectMeta(allocator, meta);
+        meta.tiered = false;
+        allocator.free(meta.storage_class);
+        meta.storage_class = try allocator.dupe(u8, "");
+        try internal.writeMetadata(bd, allocator, key, meta);
+
+        switch (self.mode) {
+            .local => try self.deleteLocalCold(bucket, key),
+            .remote => try self.deleteRemoteCold(allocator, bucket, key),
+            .off => {},
+        }
+    }
+
+    fn deleteLocalCold(self: *Tiering, bucket: []const u8, key: []const u8) !void {
+        var root = self.tier_root orelse return error.TieringNotConfigured;
+        var bd = root.openDir(bucket, .{}) catch return;
+        defer bd.close();
+        bd.deleteFile(key) catch {};
+    }
+
+    fn deleteRemoteCold(self: *Tiering, allocator: Allocator, bucket: []const u8, key: []const u8) !void {
+        const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/{s}", .{ self.url, self.tier_bucket, bucket, key });
+        defer allocator.free(url);
+
+        var amz_date_buf: [16]u8 = undefined;
+        const now = std.time.nanoTimestamp();
+        const amz_date = s3_client.fmtAmzDate(&amz_date_buf, now);
+        const date_stamp = amz_date[0..8];
+
+        const uri = try self.pathOnly(allocator, bucket, key);
+        defer allocator.free(uri);
+        const host = try self.hostOnly(allocator);
+        defer allocator.free(host);
+
+        const auth_header = try s3_client.signRequest(allocator, self.credentials(), "DELETE", uri, host, auth.unsigned_payload, amz_date, date_stamp);
+        defer allocator.free(auth_header);
+
+        var hdrs = std.ArrayList(std.http.Header){};
+        defer hdrs.deinit(allocator);
+        try hdrs.append(allocator, .{ .name = "x-amz-content-sha256", .value = auth.unsigned_payload });
+        try hdrs.append(allocator, .{ .name = "x-amz-date", .value = amz_date });
+        try hdrs.append(allocator, .{ .name = "Authorization", .value = auth_header });
+
+        var client = std.http.Client{ .allocator = allocator };
+        defer client.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .DELETE,
+            .extra_headers = hdrs.items,
+            .keep_alive = false,
+        }) catch return error.DeleteFailed;
+
+        const code = @intFromEnum(result.status);
+        if (code >= 300 and code != 404) return error.DeleteRejected;
     }
 
     fn uploadLocal(self: *Tiering, bucket: []const u8, key: []const u8, data: []const u8) !void {
@@ -326,6 +437,94 @@ test "local tiering: transitionObject stubs local file, cold copy has original b
     const cold_bytes = try tiering.fetchCold(allocator, "tier-bucket", "big.bin");
     defer allocator.free(cold_bytes);
     try std.testing.expectEqualStrings("cold me down", cold_bytes);
+}
+
+test "local tiering: GET rehydrate writes object back to hot storage and clears the stub; rehydrate-off leaves it tiered" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var cold_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer cold_tmp.cleanup();
+
+    const buckets = @import("storage/buckets.zig");
+    const objects = @import("storage/objects.zig");
+    try buckets.createBucket(tmp.dir, "rehydrate-bucket");
+
+    var tiering: Tiering = .{ .mode = .local, .tier_root = cold_tmp.dir };
+    var bd = try tmp.dir.openDir("rehydrate-bucket", .{});
+    defer bd.close();
+
+    // ── Case 1: rehydrate enabled (simulates SIMPANIZ_TIER_REHYDRATE=1) ──
+    {
+        var fbs = std.Io.Reader.fixed("bring me back");
+        const put_meta = try objects.putObjectStreaming(tmp.dir, allocator, .{
+            .bucket = "rehydrate-bucket",
+            .key = "warm.bin",
+            .content_length = 13,
+            .content_type = "text/plain",
+        }, &fbs);
+        allocator.free(put_meta.content_type);
+        allocator.free(put_meta.etag);
+
+        try tiering.transitionObject(bd, allocator, "rehydrate-bucket", "warm.bin", "COLD");
+
+        // Simulate a GET: fetch cold bytes, then rehydrate (as handlers.zig
+        // does at the fetchCold call site when the flag is on).
+        const cold_bytes = try tiering.fetchCold(allocator, "rehydrate-bucket", "warm.bin");
+        defer allocator.free(cold_bytes);
+        try std.testing.expectEqualStrings("bring me back", cold_bytes);
+
+        tiering.rehydrate(bd, allocator, "rehydrate-bucket", "warm.bin", cold_bytes);
+
+        // (a)/(b): hot object file exists again with full content.
+        var read_buf: [64]u8 = undefined;
+        const hot_bytes = try bd.readFile("warm.bin", &read_buf);
+        try std.testing.expectEqualStrings("bring me back", hot_bytes);
+
+        // (c): stub marker gone from meta.
+        const meta = try internal.readMetadata(bd, allocator, "warm.bin");
+        defer freeObjectMeta(allocator, meta);
+        try std.testing.expect(!meta.tiered);
+        try std.testing.expectEqualStrings("bring me back", (try bd.readFile("warm.bin", &read_buf)));
+
+        // (d): cold copy deleted.
+        var cold_bd = try cold_tmp.dir.openDir("rehydrate-bucket", .{});
+        defer cold_bd.close();
+        try std.testing.expectError(error.FileNotFound, cold_bd.statFile("warm.bin"));
+    }
+
+    // ── Case 2: rehydrate disabled — GET fetches cold bytes but the stub
+    // and cold copy are left untouched (default behavior, unchanged). ──
+    {
+        var fbs = std.Io.Reader.fixed("still cold here");
+        const put_meta = try objects.putObjectStreaming(tmp.dir, allocator, .{
+            .bucket = "rehydrate-bucket",
+            .key = "cold.bin",
+            .content_length = 15,
+            .content_type = "text/plain",
+        }, &fbs);
+        allocator.free(put_meta.content_type);
+        allocator.free(put_meta.etag);
+
+        try tiering.transitionObject(bd, allocator, "rehydrate-bucket", "cold.bin", "COLD");
+
+        const cold_bytes = try tiering.fetchCold(allocator, "rehydrate-bucket", "cold.bin");
+        defer allocator.free(cold_bytes);
+        try std.testing.expectEqualStrings("still cold here", cold_bytes);
+        // rehydrate() is simply not called here — mirrors handlers.zig
+        // skipping the call when config.tier_rehydrate is false.
+
+        const local_stat = try bd.statFile("cold.bin");
+        try std.testing.expectEqual(@as(u64, 0), local_stat.size);
+
+        const meta = try internal.readMetadata(bd, allocator, "cold.bin");
+        defer freeObjectMeta(allocator, meta);
+        try std.testing.expect(meta.tiered);
+
+        var cold_bd = try cold_tmp.dir.openDir("rehydrate-bucket", .{});
+        defer cold_bd.close();
+        _ = try cold_bd.statFile("cold.bin"); // still present
+    }
 }
 
 test "signRequest is deterministic and produces a well-formed Authorization header" {

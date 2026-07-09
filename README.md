@@ -109,6 +109,7 @@ All configuration is via environment variables.
 | `SIMPANIZ_TIER_ACCESS_KEY`   | *(empty)*      | Access key for SigV4-signing requests to the remote tiering target. |
 | `SIMPANIZ_TIER_SECRET_KEY`   | *(empty)*      | Secret key for SigV4-signing requests to the remote tiering target. |
 | `SIMPANIZ_TIER_REGION`       | `us-east-1`    | Region used to sign requests to the remote tiering target. |
+| `SIMPANIZ_TIER_REHYDRATE`    | *(empty)*      | When `1`/`true`/`yes`, a GET on a tiered object writes it back to hot storage and deletes the cold copy (rehydration). |
 | `SIMPANIZ_OIDC_JWKS_URL`     | *(empty)*      | Presence enables `AssumeRoleWithWebIdentity`. JWKS endpoint used to verify OIDC JWTs (ES256/RS256). |
 | `SIMPANIZ_OIDC_ISSUER`       | *(empty)*      | Required OIDC `iss` claim when `SIMPANIZ_OIDC_JWKS_URL` is set. |
 | `SIMPANIZ_OIDC_AUDIENCE`     | *(empty)*      | Optional OIDC `aud` claim to enforce. |
@@ -261,8 +262,9 @@ current limits, not "coming soon":
   pluggable external KMS; no key rotation primitives.
 - **Tiering backends.** Lifecycle `<Transition>` moves cold objects to a
   local dir (`SIMPANIZ_TIER_DIR`) or a remote S3-compatible endpoint
-  (`SIMPANIZ_TIER_URL`); no native GCS/Azure backend, no rehydration policy
-  (GET always re-fetches from cold).
+  (`SIMPANIZ_TIER_URL`); no native GCS/Azure backend. Rehydration on GET is
+  opt-in via `SIMPANIZ_TIER_REHYDRATE` (default off — GET re-fetches from
+  cold on every request).
 - **Cluster maturity.** SWIM-lite membership (active health probing, gossip,
   dynamic join) and an HRW rebalance daemon now exist, but there's no Raft, no
   decommission, and limited cluster-mode support for advanced bucket
