@@ -12,6 +12,9 @@ const index_html = @embedFile("ui_assets/index.html");
 const style_css = @embedFile("ui_assets/style.css");
 const app_js = @embedFile("ui_assets/app.js");
 const dashboard_js = @embedFile("ui_assets/dashboard.js");
+const jbm_400 = @embedFile("ui_assets/jbm-400.woff2");
+const jbm_500 = @embedFile("ui_assets/jbm-500.woff2");
+const jbm_700 = @embedFile("ui_assets/jbm-700.woff2");
 
 /// True if `path` is owned by the web console and should bypass S3 routing.
 pub fn matches(path: []const u8) bool {
@@ -34,6 +37,15 @@ pub fn serve(path: []const u8) http.Response {
     }
     if (std.mem.eql(u8, path, "/console/dashboard.js")) {
         return staticAsset("application/javascript; charset=utf-8", dashboard_js);
+    }
+    if (std.mem.eql(u8, path, "/console/fonts/jbm-400.woff2")) {
+        return staticAsset("font/woff2", jbm_400);
+    }
+    if (std.mem.eql(u8, path, "/console/fonts/jbm-500.woff2")) {
+        return staticAsset("font/woff2", jbm_500);
+    }
+    if (std.mem.eql(u8, path, "/console/fonts/jbm-700.woff2")) {
+        return staticAsset("font/woff2", jbm_700);
     }
     return .{
         .status = 404,
@@ -74,4 +86,8 @@ test "serve returns assets" {
 
     const r4 = serve("/console/dashboard.js");
     try std.testing.expectEqual(@as(u16, 200), r4.status);
+
+    const r5 = serve("/console/fonts/jbm-400.woff2");
+    try std.testing.expectEqual(@as(u16, 200), r5.status);
+    try std.testing.expectEqualStrings("font/woff2", r5.content_type);
 }

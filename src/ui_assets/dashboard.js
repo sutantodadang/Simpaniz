@@ -13,6 +13,8 @@
     active: false,
   };
 
+  const tickerState = { timer: 0 };
+
   // ── Formatting ────────────────────────────────────────────────────────
   function fmtUptime(s) {
     s = Math.max(0, s || 0);
@@ -57,7 +59,7 @@
     if (max === min) max = min + 1;
 
     // Axes.
-    ctx.strokeStyle = '#262c38';
+    ctx.strokeStyle = '#26282D';
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(padL, padT);
@@ -66,8 +68,8 @@
     ctx.stroke();
 
     // Y-axis min/max labels.
-    ctx.fillStyle = '#8a93a6';
-    ctx.font = '10px sans-serif';
+    ctx.fillStyle = '#8A8F98';
+    ctx.font = '10px "JetBrains Mono", monospace';
     ctx.textAlign = 'right';
     ctx.fillText(fmtNum(max), padL - 6, padT + 8);
     ctx.fillText(fmtNum(min), padL - 6, padT + plotH);
@@ -128,30 +130,30 @@
     const pts = series.points || [];
 
     drawChart($('chart-reqs'), [
-      { label: 'req/s', color: '#4f8cff', values: pts.map((p) => p.rps) },
-      { label: 'err/s', color: '#e2574c', values: pts.map((p) => p.eps) },
+      { label: 'req/s', color: '#FFB454', values: pts.map((p) => p.rps) },
+      { label: 'err/s', color: '#FF5C5C', values: pts.map((p) => p.eps) },
     ]);
-    legend($('legend-reqs'), [{ label: 'req/s', color: '#4f8cff' }, { label: 'err/s', color: '#e2574c' }]);
+    legend($('legend-reqs'), [{ label: 'req/s', color: '#FFB454' }, { label: 'err/s', color: '#FF5C5C' }]);
 
     drawChart($('chart-latency'), [
-      { label: 'p50', color: '#2ec27e', values: pts.map((p) => p.p50) },
-      { label: 'p95', color: '#e0a72e', values: pts.map((p) => p.p95) },
-      { label: 'p99', color: '#e2574c', values: pts.map((p) => p.p99) },
+      { label: 'p50', color: '#4BD865', values: pts.map((p) => p.p50) },
+      { label: 'p95', color: '#8A8F98', values: pts.map((p) => p.p95) },
+      { label: 'p99', color: '#FF5C5C', values: pts.map((p) => p.p99) },
     ]);
     legend($('legend-latency'), [
-      { label: 'p50', color: '#2ec27e' },
-      { label: 'p95', color: '#e0a72e' },
-      { label: 'p99', color: '#e2574c' },
+      { label: 'p50', color: '#4BD865' },
+      { label: 'p95', color: '#8A8F98' },
+      { label: 'p99', color: '#FF5C5C' },
     ]);
 
     drawChart($('chart-throughput'), [
-      { label: 'in B/s', color: '#4f8cff', values: pts.map((p) => p.in_bps) },
-      { label: 'out B/s', color: '#2ec27e', values: pts.map((p) => p.out_bps) },
+      { label: 'in B/s', color: '#FFB454', values: pts.map((p) => p.in_bps) },
+      { label: 'out B/s', color: '#4BD865', values: pts.map((p) => p.out_bps) },
     ]);
-    legend($('legend-throughput'), [{ label: 'in B/s', color: '#4f8cff' }, { label: 'out B/s', color: '#2ec27e' }]);
+    legend($('legend-throughput'), [{ label: 'in B/s', color: '#FFB454' }, { label: 'out B/s', color: '#4BD865' }]);
 
-    drawChart($('chart-inflight'), [{ label: 'in-flight', color: '#4f8cff', values: pts.map((p) => p.inflight) }]);
-    legend($('legend-inflight'), [{ label: 'in-flight', color: '#4f8cff' }]);
+    drawChart($('chart-inflight'), [{ label: 'in-flight', color: '#FFB454', values: pts.map((p) => p.inflight) }]);
+    legend($('legend-inflight'), [{ label: 'in-flight', color: '#FFB454' }]);
   }
 
   // ── Polling ──────────────────────────────────────────────────────────
@@ -181,6 +183,33 @@
     clearInterval(state.timer);
   }
 
+  // ── Topbar ticker ────────────────────────────────────────────────────
+  async function refreshTicker() {
+    if (!window.simpanizApiGet) return;
+    try {
+      const sum = await window.simpanizApiGet('/_dashboard/api/summary');
+      const parts = [
+        `uptime <b>${fmtUptime(sum.uptime_s)}</b>`,
+        `reqs <b>${fmtNum(sum.requests_total || 0)}</b>`,
+        `in-flight <b class="live">${sum.in_flight ?? 0}</b>`,
+      ];
+      if (Array.isArray(sum.membership)) {
+        const alive = sum.membership.filter((n) => n.state === 'alive').length;
+        parts.push(`nodes <b>${alive}/${sum.membership.length}</b>`);
+      }
+      $('ticker').innerHTML = parts.map((p) => `<span>${p}</span>`).join('');
+      $('ticker').classList.remove('hidden');
+    } catch (e) {
+      $('ticker').classList.add('hidden');
+    }
+  }
+
+  function startTicker() {
+    refreshTicker();
+    clearInterval(tickerState.timer);
+    tickerState.timer = setInterval(refreshTicker, 10000);
+  }
+
   // ── Wire up ───────────────────────────────────────────────────────────
   function init() {
     document.querySelectorAll('.win-btn').forEach((btn) => {
@@ -195,6 +224,8 @@
     document.addEventListener('simpaniz:tab', (e) => {
       if (e.detail.tab === 'metrics') start(); else stop();
     });
+
+    document.addEventListener('simpaniz:login', startTicker);
   }
 
   if (document.readyState === 'loading') {

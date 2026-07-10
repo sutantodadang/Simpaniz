@@ -293,6 +293,7 @@
     $('who').textContent = state.creds.anon
       ? 'anonymous'
       : `${state.creds.access} · ${state.creds.region}`;
+    document.dispatchEvent(new CustomEvent('simpaniz:login'));
   }
 
   function renderBuckets() {
